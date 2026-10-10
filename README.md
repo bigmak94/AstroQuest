@@ -194,7 +194,7 @@ games, and this repository does not include any game data.
 
 **Which headsets?** On the headset alone: Quest 3 (the Quest 3S has the same chip and should
 work; nobody has reported it yet). A Quest 2 or Pro has not been tried and is slower. On a
-PC: any headset with an OpenXR runtime on Windows, which is every Quest through Virtual
+PC: any headset with an OpenXR runtime on Windows (or SteamVR on Linux, see below), which is every Quest through Virtual
 Desktop or Steam Link, and PC headsets through SteamVR (Index, PS VR2 with its PC adapter,
 Bigscreen Beyond, Pimax and others have been reported working).
 
@@ -220,8 +220,10 @@ another from.
 0.19 (it looked in the wrong place when it was started from a 32-bit program), and its
 question now has a "start the game all the same".
 
-**Linux?** There is no Linux build of the PC version. A player reports it running through
-Steam's Proton with WiVRn; their recipe is in
+**Linux?** The emulator builds natively on Linux, with no release package yet; how to build
+and start it, and the SteamVR setting it needs, are in
+[README-PC-VR.md](README-PC-VR.md#linux-native-build). A player also reports the Windows
+build running through Steam's Proton with WiVRn; their recipe is in
 [README-PC-VR.md](README-PC-VR.md#linux-through-proton-as-reported).
 
 ## Building from source
