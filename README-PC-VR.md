@@ -541,9 +541,51 @@ Reports from the project's thread on Reddit and from the comments under the vide
   folder it is about; started any other way, it came. It is only asked now where there is
   something to move.
 
+## Linux, native build
+
+The emulator builds and runs natively on Linux, with the same OpenXR host as on Windows.
+There is no release package and no launcher for it: build it and set the launcher's
+environment variables yourself. Tried on x86-64 with a Valve Index through SteamVR on an
+NVIDIA card.
+
+1. Build it, with clang, CMake and Ninja, from a clone made with its submodules (see
+   "Building from source" in README.md); SDL needs the usual X11, Wayland, ALSA and
+   PulseAudio development packages:
+
+   ```sh
+   cd shadps4-arm64-main
+   cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+   cmake --build build
+   ```
+
+2. **Turn on SteamVR's asynchronous reprojection.** SteamVR on Linux leaves it off, and
+   without it the frames the game draws for every other refresh are shown again as drawn,
+   not turned to where the head is: the picture judders whenever the head moves (the
+   window on the desktop looks right all the same). With SteamVR closed, add
+   `"enableLinuxVulkanAsync" : true` to the `"steamvr"` section of
+   `~/.local/share/Steam/config/steamvr.vrsettings` (under `~/.var/app/com.valvesoftware.Steam/`
+   for Steam from Flatpak). Its log (`logs/vrcompositor.txt` next to `config`) then says
+   `Enabling async support!`. Set the refresh rate as for the Index above: 120 Hz for the
+   game's 60 frames a second.
+3. Make SteamVR the OpenXR runtime (SteamVR's Settings > OpenXR), and the headset's
+   speakers and microphone the system's default devices: the emulator plays to the default
+   output.
+4. Start SteamVR, then the emulator. It keeps its settings and saves in a `user` folder in
+   the folder it is started from if there is one, otherwise in `$XDG_DATA_HOME/shadPS4`
+   (`~/.local/share/shadPS4`):
+
+   ```sh
+   SHADPS4_OPENXR=1 SHADPS4_XR_WAIT=60 SHADPS4_TITLE_EYE_WIDTH=2880 SHADPS4_VR_FPS_CAP=60 \
+   SHADPS4_VR_FOV=100 SHADPS4_VR_FOV_OF=headset SHADPS4_VR_SHARPEN=0.3 \
+   /path/to/shadps4-arm64-main/build/shadps4 -g /path/to/games/CUSA12392/eboot.bin
+   ```
+
+   The settings of "Settings" above are these variables; `pc-vr/launch.ps1` shows which
+   variable each one sets.
+
 ## Linux, through Proton, as reported
 
-There is no Linux build of the PC version, and none of this has been tried here. A player
+The native build above is the more direct way; none of this has been tried here. A player
 (klejmanm, on Reddit) reports the Windows build running on Arch and Mint with Radeon RX
 6000/7000 cards, shown in a Quest through WiVRn, when it is started by Steam and not by a
 script of one's own (Wine's OpenXR layer got in the way otherwise):
@@ -764,4 +806,4 @@ bash tools/make-pc-vr.sh                                                   # cop
 ```
 
 The OpenXR loader (Khronos OpenXR-SDK 1.1.63, `externals/openxr-sdk`) is built with the
-emulator; `ENABLE_OPENXR` (on for Windows) switches the whole of it.
+emulator; `ENABLE_OPENXR` (on for Windows and Linux) switches the whole of it.

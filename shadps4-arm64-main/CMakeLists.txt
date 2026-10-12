@@ -44,7 +44,7 @@ option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 option(ENABLE_FEX_GUEST_CPU "Build the native ARM64 FEXCore guest CPU backend" OFF)
 # The headset of the machine the emulator runs on, through that machine's OpenXR runtime
 # (Virtual Desktop, SteamVR, ...): where the frames of an emulated PlayStation VR are shown.
-cmake_dependent_option(ENABLE_OPENXR "Show the emulated headset's frames in a headset of this machine" ON "WIN32;NOT ENABLE_BACHATA_RUNTIME" OFF)
+cmake_dependent_option(ENABLE_OPENXR "Show the emulated headset's frames in a headset of this machine" ON "WIN32 OR CMAKE_SYSTEM_NAME STREQUAL \"Linux\";NOT ENABLE_BACHATA_RUNTIME" OFF)
 set(FEXCORE_GUEST_CPU_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/runtime/sources/fex" CACHE PATH
     "Checked-out FEX source directory for the FEXCore guest CPU backend")
 set(FEXCORE_GUEST_CPU_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/runtime/build/fexcore-smoke-build" CACHE PATH
