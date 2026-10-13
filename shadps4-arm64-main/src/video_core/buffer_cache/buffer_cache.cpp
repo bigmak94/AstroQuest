@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/vertex_buffer_bind_path.h"
+#include "video_core/renderer_vulkan/vk_gpu_profile.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -199,6 +200,7 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
     if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.
         const auto cmdbuf = scheduler.CommandBuffer();
+        const Vulkan::FrameStats::CallTimer timer{Vulkan::FrameStats::Call::VertexInput};
         cmdbuf.setVertexInputEXT(bindings, attributes);
     }
 
@@ -286,6 +288,7 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
     // fetch-shader stream has stride zero.
     const auto bind_path =
         SelectVertexBufferBindPath(instance.IsVertexInputDynamicState());
+    const Vulkan::FrameStats::CallTimer timer{Vulkan::FrameStats::Call::VertexBuffers};
     if (bind_path == VertexBufferBindPath::Core) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
     } else {
@@ -308,6 +311,7 @@ void BufferCache::BindIndexBuffer(u32 index_offset) {
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
     const auto cmdbuf = scheduler.CommandBuffer();
+    const Vulkan::FrameStats::CallTimer timer{Vulkan::FrameStats::Call::IndexBuffer};
     cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
 }
 
@@ -332,6 +336,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::BufferCopy, num_bytes);
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -444,6 +449,67 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         gpu_modified_ranges.Add(device_addr, size);
     }
     return {&buffer, buffer.Offset(device_addr)};
+}
+
+std::pair<Buffer*, u32> BufferCache::ObtainUniformBuffer(VAddr device_addr, u32 size,
+                                                         BufferId buffer_id) {
+    // The shaders add nothing to a uniform buffer's offset (the headset's GPU needs no offset
+    // added to storage buffers, so the shaders are not made to), and the GPU checks reads
+    // against a uniform buffer's end by rows of 16 bytes: it starts where one may, and what
+    // lies past the guest buffer's end in its last row reads as zero, as past the end of a
+    // buffer on the console.
+    if (!AmdGpu::GpuBufferCopySourceUsable(device_addr, size)) {
+        return ObtainBuffer(device_addr, size, false, false, buffer_id);
+    }
+    const u64 alignment = instance.UniformMinAlignment();
+    const u32 rows = static_cast<u32>(Common::AlignUp(u64{size}, u64{16}));
+    if (size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
+        const auto [data, offset] = stream_buffer.Map(rows, alignment);
+        std::memcpy(data, reinterpret_cast<const void*>(device_addr), size);
+        std::memset(data + size, 0, rows - size);
+        stream_buffer.Commit();
+        return {&stream_buffer, static_cast<u32>(offset)};
+    }
+    const auto [buffer, offset] = ObtainBuffer(device_addr, size, false, false, buffer_id);
+    if (offset % alignment == 0 && size % 16 == 0) {
+        return {buffer, offset};
+    }
+    // Written by the GPU where it lies: copied on the GPU to where a uniform buffer may start.
+    static u32 copies = 0;
+    if (++copies <= 3) {
+        LOG_INFO(Render_Vulkan,
+                 "A uniform buffer the GPU wrote ({} bytes at {:#x}, offset {} of its buffer) is "
+                 "copied to where one may start",
+                 size, device_addr, offset);
+    }
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto [data, stream_offset] = stream_buffer.Map(rows, alignment);
+    std::memset(data + size, 0, rows - size);
+    stream_buffer.Commit();
+    if (const auto before = buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,
+                                               vk::PipelineStageFlagBits2::eTransfer)) {
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &*before,
+        });
+    }
+    cmdbuf.copyBuffer(buffer->Handle(), stream_buffer.Handle(),
+                      vk::BufferCopy{.srcOffset = offset, .dstOffset = stream_offset, .size = size});
+    const vk::BufferMemoryBarrier2 after{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead,
+        .buffer = stream_buffer.Handle(),
+        .offset = stream_offset,
+        .size = rows,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &after,
+    });
+    return {&stream_buffer, static_cast<u32>(stream_offset)};
 }
 
 void BufferCache::RefreshImageStagingCompletions() {
@@ -849,6 +915,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                               bool accumulate_stream_score) {
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::BufferCopy, overlap.SizeBytes());
     if (accumulate_stream_score) {
         new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
     }
@@ -984,6 +1051,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
 
     if (src_buffer) {
+        Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::BufferUpload, total_size_bytes);
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();
         const vk::BufferMemoryBarrier2 pre_barrier = {
@@ -1113,6 +1181,7 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::BufferCopy, num_bytes);
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),

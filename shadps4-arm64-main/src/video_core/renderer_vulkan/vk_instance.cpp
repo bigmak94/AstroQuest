@@ -21,6 +21,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/legacy_vertex_attributes.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_foveation.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -401,6 +402,53 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- sampler2DViewOf3D: {}",
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
+    // Coarser shading towards the edges of a headset's pictures, where asked for (Foveation):
+    // a map of how coarsely to shade each part, given to the render passes that draw them.
+    if (Foveation::Level() > 0 && add_extension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+        const auto rate_features =
+            physical_device
+                .getFeatures2<vk::PhysicalDeviceFeatures2,
+                              vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>()
+                .get<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
+        const auto rate_properties =
+            physical_device
+                .getProperties2<vk::PhysicalDeviceProperties2,
+                                vk::PhysicalDeviceFragmentShadingRatePropertiesKHR>()
+                .get<vk::PhysicalDeviceFragmentShadingRatePropertiesKHR>();
+        const auto smallest = rate_properties.minFragmentShadingRateAttachmentTexelSize;
+        const auto largest = rate_properties.maxFragmentShadingRateAttachmentTexelSize;
+        const u32 texel_low = std::max(smallest.width, smallest.height);
+        const u32 texel_high = std::min(largest.width, largest.height);
+        foveation = rate_features.attachmentFragmentShadingRate &&
+                    rate_features.pipelineFragmentShadingRate && texel_low != 0 &&
+                    texel_low <= texel_high;
+        if (foveation) {
+            foveation_texel = std::clamp(Foveation::WantedTexel, texel_low, texel_high);
+            // 1x1, 1x2, 2x1 and 2x2 come with the feature; what else, the GPU says.
+            foveation_rates = {{1, 1}, {1, 2}, {2, 1}, {2, 2}};
+            if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFragmentShadingRatesKHR) {
+                const auto [rates_result, rates] = physical_device.getFragmentShadingRatesKHR();
+                if (rates_result == vk::Result::eSuccess) {
+                    foveation_rates.clear();
+                    for (const auto& rate : rates) {
+                        if (rate.sampleCounts & vk::SampleCountFlagBits::e1) {
+                            foveation_rates.push_back(rate.fragmentSize);
+                        }
+                    }
+                }
+            }
+            LOG_INFO(Render_Vulkan, "Foveation possible: shading rate maps of {}x{} pixels a texel",
+                     foveation_texel, foveation_texel);
+        } else {
+            LOG_WARNING(Render_Vulkan,
+                        "Foveation not possible: shading rates by attachment {}, by pipeline {}, "
+                        "map texels {}x{} to {}x{}",
+                        static_cast<bool>(rate_features.attachmentFragmentShadingRate),
+                        static_cast<bool>(rate_features.pipelineFragmentShadingRate),
+                        smallest.width, smallest.height, largest.width, largest.height);
+            enabled_extensions.pop_back();
+        }
+    }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     external_memory_dma_buf = add_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
                               add_extension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
@@ -580,6 +628,11 @@ bool Instance::CreateDevice() {
             .image2DViewOf3D = image_2d_view_of_3d_features.image2DViewOf3D,
             .sampler2DViewOf3D = image_2d_view_of_3d_features.sampler2DViewOf3D,
         },
+        vk::PhysicalDeviceFragmentShadingRateFeaturesKHR{
+            .pipelineFragmentShadingRate = true,
+            .primitiveFragmentShadingRate = false,
+            .attachmentFragmentShadingRate = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -630,6 +683,9 @@ bool Instance::CreateDevice() {
     }
     if (!image_2d_view_of_3d) {
         device_chain.unlink<vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT>();
+    }
+    if (!foveation) {
+        device_chain.unlink<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());

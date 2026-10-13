@@ -84,3 +84,38 @@ private:
     GLint uniform_fov{-1};
     bool write_control{};
 };
+
+/// The GPU's time from the start of what is drawn between Begin and End (a frame's copy) to its
+/// end, as opposed to the time from handing it over to its end, which includes waiting behind
+/// the emulator's work. What another context does on the GPU in between (the compositor, which
+/// takes the GPU at every refresh) is counted too. Needs GL_EXT_disjoint_timer_query; does
+/// nothing without it.
+class GpuTimer {
+public:
+    bool Create();
+    void Destroy();
+
+    void Begin();
+    void End();
+
+    struct Summary {
+        float mean_ms{};
+        float worst_ms{};
+        uint32_t count{};
+    };
+    /// What the timed work took since this was last asked.
+    Summary Take();
+
+private:
+    void Collect();
+
+    static constexpr uint32_t Slots = 4;
+    GLuint queries[Slots]{};
+    bool pending[Slots]{};
+    uint32_t next{};
+    bool available{};
+    bool timing{};
+    double sum_ms{};
+    float worst_ms{};
+    uint32_t count{};
+};

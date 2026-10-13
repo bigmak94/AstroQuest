@@ -1,11 +1,29 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
+#include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
+
+namespace {
+
+/// SHADPS4_DBG_NO_SHADOW_TAPS=1: a measuring aid. What pixel shaders take from a depth texture
+/// by comparison (the taps that filter a shadow map's edge) reads as fully lit, so the driver
+/// drops the taps and the sums that place them: what those taps cost the GPU. Shadows are gone.
+bool LeavesShadowTapsOut(const EmitContext& ctx) {
+    // (Not with the pipeline cache on disk, which would keep such shaders for later runs.)
+    static const bool leave_out = [] {
+        const char* value = std::getenv("SHADPS4_DBG_NO_SHADOW_TAPS");
+        return value != nullptr && value[0] == '1' && !EmulatorSettings.IsPipelineCacheEnabled();
+    }();
+    return leave_out && ctx.stage == Stage::Fragment;
+}
+
+} // namespace
 
 struct ImageOperands {
     void Add(spv::ImageOperandsMask new_mask, Id value) {
@@ -87,6 +105,10 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     operands.AddOffset(ctx, offset);
     const Id sample = ctx.OpImageSampleImplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
+    // A known title's final pass reading its scene: with FSR 1 where it is enlarged.
+    if (Sirit::ValidId(ctx.scene_easu) && handle == 0 && operands.operands.empty()) {
+        return ctx.OpFunctionCall(ctx.F32[4], ctx.scene_easu, coords, sample);
+    }
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
 }
 
@@ -107,6 +129,10 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
 
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
                                   Id bias, const IR::Value& offset) {
+    if (LeavesShadowTapsOut(ctx)) {
+        return ctx.OpCompositeConstruct(ctx.F32[4], ctx.ConstF32(1.0f), ctx.f32_zero_value,
+                                        ctx.f32_zero_value, ctx.f32_zero_value);
+    }
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
     const Id result_type = texture.data_types->Get(1);
@@ -124,6 +150,10 @@ Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, 
 
 Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
                                   Id lod, const IR::Value& offset) {
+    if (LeavesShadowTapsOut(ctx)) {
+        return ctx.OpCompositeConstruct(ctx.F32[4], ctx.ConstF32(1.0f), ctx.f32_zero_value,
+                                        ctx.f32_zero_value, ctx.f32_zero_value);
+    }
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
     const Id result_type = texture.data_types->Get(1);

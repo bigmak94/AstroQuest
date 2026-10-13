@@ -43,6 +43,15 @@ float Peak(vec3 rgb) {
 void main() {
     const vec2 texel = 1.0 / vec2(textureSize(scene, 0));
     const vec4 centre = textureLod(scene, uv, 0.0);
+#ifdef FINE_RADIUS
+    // Outside the middle of an eye's scene, which foveated rendering shades in blocks of
+    // pixels anyway, edges are left as they were drawn: a copy.
+    const vec2 from_middle = uv * 2.0 - 1.0;
+    if (dot(from_middle, from_middle) >= FINE_RADIUS * FINE_RADIUS) {
+        out_color = centre;
+        return;
+    }
+#endif
     const float m = Brightness(centre.rgb);
     const float n = Brightness(textureLodOffset(scene, uv, 0.0, ivec2(0, -1)).rgb);
     const float s = Brightness(textureLodOffset(scene, uv, 0.0, ivec2(0, 1)).rgb);

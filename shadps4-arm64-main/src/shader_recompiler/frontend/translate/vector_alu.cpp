@@ -5,6 +5,10 @@
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/profile.h"
 
+#include <atomic>
+
+#include "common/logging/log.h"
+
 namespace Shader::Gcn {
 
 void Translator::EmitVectorAlu(const GcnInst& inst) {
@@ -23,7 +27,7 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_SUBREV_F32:
         return V_SUBREV_F32(inst);
     case Opcode::V_MAC_LEGACY_F32:
-        return V_MAC_F32(inst);
+        return V_MAC_LEGACY_F32(inst);
     case Opcode::V_MUL_LEGACY_F32:
         return V_MUL_LEGACY_F32(inst);
     case Opcode::V_MUL_F32:
@@ -381,7 +385,7 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
 
         // VOP3a
     case Opcode::V_MAD_LEGACY_F32:
-        return V_MAD_F32(inst);
+        return V_MAD_LEGACY_F32(inst);
     case Opcode::V_MAD_F32:
         return V_MAD_F32(inst);
     case Opcode::V_MAD_I32_I24:
@@ -689,6 +693,26 @@ void Translator::V_BFM_B32(const GcnInst& inst) {
 void Translator::V_MAC_F32(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.FPFma(GetSrc<IR::F32>(inst.src[0]), GetSrc<IR::F32>(inst.src[1]),
                                  GetSrc<IR::F32>(inst.dst[0])));
+}
+
+IR::F32 Translator::LegacyFma(const IR::F32& a, const IR::F32& b, const IR::F32& c) {
+    // GCN's legacy multiply-adds follow DX9: a source of zero makes the product zero even where
+    // the other one is infinite or NaN. An ordinary one gives NaN for zero times infinity, and
+    // a NaN in what a shader draws spreads through the blurs of a glow into black squares.
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+        LOG_INFO(Render_Vulkan,
+                 "Shader {:#x} has a legacy multiply-add: zero times anything is zero there",
+                 info.pgm_hash);
+    }
+    const IR::F32 zero{ir.Imm32(0.0f)};
+    const IR::U1 either_zero{ir.LogicalOr(ir.FPEqual(a, zero), ir.FPEqual(b, zero))};
+    return IR::F32{ir.Select(either_zero, c, ir.FPFma(a, b, c))};
+}
+
+void Translator::V_MAC_LEGACY_F32(const GcnInst& inst) {
+    SetDst(inst.dst[0], LegacyFma(GetSrc<IR::F32>(inst.src[0]), GetSrc<IR::F32>(inst.src[1]),
+                                  GetSrc<IR::F32>(inst.dst[0])));
 }
 
 void Translator::V_MADMK_F32(const GcnInst& inst) {
@@ -1322,6 +1346,13 @@ void Translator::V_MAD_F32(const GcnInst& inst) {
     const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
     const IR::F32 src2{GetSrc<IR::F32>(inst.src[2])};
     SetDst(inst.dst[0], ir.FPFma(src0, src1, src2));
+}
+
+void Translator::V_MAD_LEGACY_F32(const GcnInst& inst) {
+    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
+    const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
+    const IR::F32 src2{GetSrc<IR::F32>(inst.src[2])};
+    SetDst(inst.dst[0], LegacyFma(src0, src1, src2));
 }
 
 void Translator::V_MAD_I32_I24(const GcnInst& inst, bool is_signed) {

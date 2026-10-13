@@ -173,6 +173,7 @@ public:
     void V_OR_B32(bool is_xor, const GcnInst& inst);
     void V_BFM_B32(const GcnInst& inst);
     void V_MAC_F32(const GcnInst& inst);
+    void V_MAC_LEGACY_F32(const GcnInst& inst);
     void V_MADMK_F32(const GcnInst& inst);
     void V_BCNT_U32_B32(const GcnInst& inst);
     void V_MBCNT_U32_B32(bool is_low, const GcnInst& inst);
@@ -248,6 +249,9 @@ public:
 
     // VOP3a
     void V_MAD_F32(const GcnInst& inst);
+    void V_MAD_LEGACY_F32(const GcnInst& inst);
+    /// a * b + c with DX9's multiply: zero when a or b is zero, whatever the other one is.
+    IR::F32 LegacyFma(const IR::F32& a, const IR::F32& b, const IR::F32& c);
     void V_MAD_I32_I24(const GcnInst& inst, bool is_signed = true);
     void V_MAD_U32_U24(const GcnInst& inst);
     void V_CUBEID_F32(const GcnInst& inst);

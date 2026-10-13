@@ -8,20 +8,28 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 #include <fmt/format.h>
 
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/known_title.h"
 #include "core/known_title_builds.h"
+#include "core/known_title_scenes.h"
 #include "core/memory.h"
 #include "core/vr/vr_runtime.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Core::KnownTitle {
@@ -62,6 +70,10 @@ constexpr u64 ResolutionLowest = 0x2c;  // s32, an offset
 /// every other build.
 std::atomic<const Build*> known_build{nullptr};
 VAddr known_base{};
+
+/// The size the title draws its scene at for an eye right now, width << 16 | height; 0 while
+/// it is not known.
+std::atomic<u32> scene_size{0};
 
 /// The title drawing larger than it does on the console: every size of the headset's list (and
 /// the pictures handed to the headset) grown by the same factor, and the memory that takes.
@@ -141,8 +153,14 @@ std::atomic<u32> frame_pace{0};
 struct Settings {
     bool time_step{true};
     /// Frames longer than this are not made up for: the game slows down instead of taking
-    /// steps its physics were never tried with.
-    double longest_step{1.0 / 20.0};
+    /// steps it was never tried with. Twice the step it was made for is as far as that goes:
+    /// with steps of 37 ms and more (35 are still fine) something in the game comes out as no
+    /// number at all. Seen in level 3-2 (INDY CAVE 1): the robot that hangs tied up there is
+    /// then at no place from the moment the level loads, and its cry for help, which should
+    /// fade with distance, is heard at full strength wherever the player is. At 30 frames a
+    /// second every hitch got it there, because the frames after one are given longer steps to
+    /// catch up: those steps end here too.
+    double longest_step{1.0 / 30.0};
 
     enum class Resolution { Title, Pinned, Governed };
     Resolution resolution{Resolution::Governed};
@@ -158,12 +176,21 @@ struct Settings {
     /// The most frames a second wanted, 0 for no such limit: frames are given at least as many
     /// refreshes as keep them to that.
     double fps_cap{};
+    /// Frames a second to hold the title to throughout, 0 to choose: frames are given the most
+    /// refreshes that still make that many (3 at 90 Hz and 4 at 120 Hz for 30), and only the
+    /// size of the scene follows what the GPU manages.
+    double steady_fps{};
+    /// The largest size the scene is drawn at where the size is chosen here.
+    s32 largest_level{LastHeadsetLevel};
 
     /// The title's physics take each step with the time step its bodies were sent with
     /// (Builds::PhysicsStepChanges): what a time step that changes needs.
     bool physics_step{true};
     /// Where the bodies the title moves by hand end up goes to the log (PhysicsWatch).
     bool physics_watch{false};
+
+    /// How much of what the title draws is drawn (SceneFile).
+    Scenes::Detail scene_detail{};
 };
 
 const Settings& GetSettings() {
@@ -203,6 +230,23 @@ const Settings& GetSettings() {
                 parsed.fps_cap = std::min(cap, 240.0);
             }
         }
+        // SHADPS4_VR_STEADY_FPS=<frames a second>: always that many (as many refreshes a frame
+        // as still make them: 3 at 90 Hz, 4 at 120 Hz for 30; at 72 Hz 2, which is 36), the
+        // scene's size alone following what the GPU manages.
+        if (const char* value = std::getenv("SHADPS4_VR_STEADY_FPS"); value != nullptr) {
+            const double fps = std::atof(value);
+            if (fps >= 10.0) {
+                parsed.steady_fps = std::min(fps, 120.0);
+            }
+        }
+        // SHADPS4_VR_LARGEST_SIZE=<3..6>: where the size is chosen here, none larger than that
+        // (3 = 816x870 ... 6 = 1440x1536).
+        if (const char* value = std::getenv("SHADPS4_VR_LARGEST_SIZE"); value != nullptr) {
+            const s32 level = std::atoi(value);
+            if (level >= FirstHeadsetLevel && level <= LastHeadsetLevel) {
+                parsed.largest_level = level;
+            }
+        }
         // SHADPS4_TITLE_PHYSICS_STEP=0 leaves the title's physics as the console has them;
         // SHADPS4_TITLE_PHYSICS_WATCH=1 tells in the log where its bodies end up.
         if (const char* value = std::getenv("SHADPS4_TITLE_PHYSICS_STEP"); value != nullptr) {
@@ -211,10 +255,65 @@ const Settings& GetSettings() {
         if (const char* value = std::getenv("SHADPS4_TITLE_PHYSICS_WATCH"); value != nullptr) {
             parsed.physics_watch = std::atoi(value) != 0;
         }
+        // SHADPS4_TITLE_LOD=<share>: the distances at which models change to their coarser
+        // forms, as a share of the title's own (0.33 = a third); SHADPS4_TITLE_SHADOW_MAP=
+        // <1024|1536>: the sun's shadow maps no larger than that; SHADPS4_TITLE_DEPTH_PREPASS=0:
+        // the scene's depth not drawn on its own first.
+        if (const char* value = std::getenv("SHADPS4_TITLE_LOD"); value != nullptr) {
+            const double share = std::atof(value);
+            if (share > 0.0) {
+                parsed.scene_detail.lod_scale = std::clamp(share, 0.1, 1.0);
+            }
+        }
+        if (const char* value = std::getenv("SHADPS4_TITLE_SHADOW_MAP"); value != nullptr) {
+            const int size = std::atoi(value);
+            parsed.scene_detail.shadow_map_size = size == 1024 || size == 1536 ? size : 0;
+        }
+        if (const char* value = std::getenv("SHADPS4_TITLE_DEPTH_PREPASS"); value != nullptr) {
+            parsed.scene_detail.depth_prepass = std::atoi(value) != 0;
+        }
+        // SHADPS4_TITLE_PREPASS_DISTANCE=<m>, SHADPS4_TITLE_PREPASS_RADIUS=<m>: how far away
+        // models still get the depth pre-pass, and how small they may be (measuring aids).
+        if (const char* value = std::getenv("SHADPS4_TITLE_PREPASS_DISTANCE"); value != nullptr) {
+            parsed.scene_detail.prepass_distance = std::atof(value);
+        }
+        if (const char* value = std::getenv("SHADPS4_TITLE_PREPASS_RADIUS"); value != nullptr) {
+            parsed.scene_detail.prepass_radius = std::atof(value);
+        }
+        // SHADPS4_TITLE_DARK_SUN_SHADOWS=0 keeps the sun's shadow maps in the levels whose sun
+        // is black (Scenes::DarkSunFiles), =2 also leaves them out in 3-2.
+        if (const char* value = std::getenv("SHADPS4_TITLE_DARK_SUN_SHADOWS"); value != nullptr) {
+            parsed.scene_detail.dark_sun = std::clamp(std::atoi(value), 0, 2);
+        }
         return parsed;
     }();
     return settings;
 }
+
+/// The share of a frame's GPU work that does not grow with the scene's pixels: the shadow maps,
+/// the game's eye pictures (1440x1536 whatever the scene's size), the copies for the headset and
+/// what every draw costs whatever its size. Measured on the headset with the models lighter and
+/// the edges shaded coarsely, the two sizes taking turns within one run at the same clock
+/// (2026-10-09, level 3-2, 30 frames a second): 960x1080 cost 1.21 times what 816x870 did, and
+/// 1200x1280 1.20 times what 960x1080 did (counted here as 1.26: the larger sizes a little
+/// dearer than seen, where a step up that fails is what costs most).
+constexpr double FixedShare = 0.55;
+/// What a frame's GPU work at each size is counted as, in terms of the smallest.
+constexpr std::array<double, 7> SizeCost = [] {
+    std::array<double, 7> cost{1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    const double smallest = static_cast<double>(ConsoleSizes[FirstHeadsetLevel][0]) *
+                            static_cast<double>(ConsoleSizes[FirstHeadsetLevel][1]);
+    for (s32 level = FirstHeadsetLevel; level <= LastHeadsetLevel; ++level) {
+        const double pixels = static_cast<double>(ConsoleSizes[level][0]) *
+                              static_cast<double>(ConsoleSizes[level][1]);
+        cost[level] = FixedShare + (1.0 - FixedShare) * pixels / smallest;
+    }
+    return cost;
+}();
+/// The same as measured on the headset with the title's own detail (2026-10-02), where most of
+/// a frame's work does not grow with its pixels: what a smaller size is counted to save where a
+/// faster pace is weighed.
+constexpr std::array<double, 7> CautiousSmallerCost{1.0, 1.0, 1.0, 1.0, 1.08, 1.27, 1.54};
 
 /// Chooses how many refreshes of the headset a frame is given, and the size the scene is drawn
 /// at, from what the title manages and how busy the GPU really is. Asked every frame with what
@@ -226,13 +325,37 @@ const Settings& GetSettings() {
 /// or for three as they happen to fall, which is what jerky motion is. So the question is
 /// never "how fast" alone but "how many refreshes, and what fits into them":
 ///  - the pace is the fastest at which the smallest size wanted fits with room to spare. That
-///    size is the console's own smallest (960x1080); only at the slowest pace there is - the
-///    last that still makes 30 frames a second - the smallest size of all (816x870) will do.
+///    size is the console's own smallest (960x1080) wherever frames are given less than 30 ms
+///    (40 frames a second and more): a sharper picture is worth more than 40 frames a second
+///    instead of 30. Only at the slowest pace frames are held to (30 frames a second; at 72 or
+///    80 Hz the one pace there is, 36 or 40), or where the pace is not the emulator's to choose,
+///    will the smallest size of all (816x870) do, since fewer frames than that are worse than a
+///    softer picture.
 ///    The emulated headset refreshes at half that pace (FramePace), which is what the title
 ///    keeps time by, and every frame is shown for as long as the next;
 ///  - the size is the largest that fits that pace with room to spare;
-///  - what a size costs is taken from what it was seen to cost, and a step that had to be
-///    taken back makes the next one wait longer (and a size count as dearer).
+///  - what a size costs is taken from what it was seen to cost, at the clock the GPU could
+///    have run at, as if about half the work grew with the pixels (FixedShare); where frames
+///    do not fit, by the time the GPU really took. (What a step between two sizes was seen to
+///    cost goes to the log; while the player moves it says more about the view than about the
+///    size, so it does not count.) The picture only grows where that has left a fifth of a
+///    frame's time to spare for four seconds in a row (a frame that came late, or one that held
+///    everything up, starts the count again), not within ten seconds of the last change, and
+///    never beyond the largest size allowed (SHADPS4_VR_LARGEST_SIZE: the Quest app has
+///    1200x1280; 1440x1536 fits only in light scenes, and the heavy scene that follows one is
+///    drawn too large until the size comes down); frames that do not fit are given a smaller
+///    picture before they are given more refreshes;
+///  - every change costs frames that come unevenly while it settles, and a faster pace that
+///    turns out not to fit costs seconds of them. So a faster pace is only tried after five
+///    seconds in which all a frame takes fits it with a quarter to spare: the GPU's work, the
+///    GPU thread's processor time, and the title's own work where a try at that pace showed it
+///    to be too much, the GPU's work counted as if a smaller picture saved little. A failed try
+///    makes the next one wait longer, a size that had to be taken back within half a minute is
+///    gone back from (and counts as dearer, until the title loads another scene; the next step
+///    up waits a quarter of a minute, then twice as long each time), the picture only grows
+///    once a faster pace has held, and after two seconds of loading in which nothing was
+///    drawn it starts again from the console's smallest size at most. (Astro Bot loads its
+///    levels while it goes on drawing at full speed: that is not seen as loading.)
 class Governor {
 public:
     /// For `fixed`: the size is the title's own business.
@@ -242,13 +365,22 @@ public:
         s32 pace;
         double slot;
         double load;
+        /// What the next larger size is counted to cost, in terms of this one's work (0 at the
+        /// largest).
+        double next_cost;
     };
 
     /// `fixed_pace_`: refreshes to give every frame, 0 to choose; `fastest_pace_`: the fewest
     /// the choice may come to on a display that refreshes faster than the title draws.
-    Governor(s32 fixed_pace_, s32 fastest_pace_, double fps_cap_)
+    Governor(s32 fixed_pace_, s32 fastest_pace_, double fps_cap_, double steady_fps_,
+             s32 largest_level_)
         : fixed_pace{fixed_pace_}, fastest_pace{fastest_pace_}, fps_cap{fps_cap_},
-          pace{fixed_pace_ >= 1 ? fixed_pace_ : 2} {}
+          steady_fps{fixed_pace_ >= 1 ? 0.0 : steady_fps_},
+          largest{std::clamp(largest_level_, FirstHeadsetLevel, LastHeadsetLevel)},
+          pace{fixed_pace_ >= 1 ? fixed_pace_ : 2} {
+        level = std::min(level, largest);
+        size_before_up = level;
+    }
 
     /// `fixed` is a size to keep to, 0 where the size is to be chosen here, NotMine where the
     /// title chooses it. Answers with the size to hold the title to, 0 for none.
@@ -268,7 +400,22 @@ public:
             fastest_now = std::max<s32>(
                 1, static_cast<s32>(std::ceil(1.0 / (refresh * fps_cap) - 0.01)));
         }
-        if (fixed_pace == 0 && (fastest_now != fastest || pace < fastest_now)) {
+        if (steady_fps > 0.0) {
+            // The most refreshes that still make the frames asked for, whatever the display's
+            // rate is now.
+            const s32 steady = std::clamp<s32>(
+                static_cast<s32>(std::floor(1.0 / (refresh * steady_fps) + 0.01)), 1, SlowestPace);
+            if (steady != pace && started) {
+                LOG_INFO(Core,
+                         "Frames are given {} refreshes from now on ({:.0f} a second): the "
+                         "display refreshes {:.0f} times a second",
+                         steady, 1.0 / (steady * refresh), 1.0 / refresh);
+            }
+            pace = steady;
+            fastest_now = steady;
+        }
+        if (fixed_pace == 0 && steady_fps == 0.0 &&
+            (fastest_now != fastest || pace < fastest_now)) {
             // The display turned out to be another kind than was thought (its rate is only
             // known once the headset is there): no waiting to find out what fits.
             if (fastest_now == 1 && refresh > SlowDisplay) {
@@ -283,10 +430,14 @@ public:
             window_start = now;
             changed = now;
             Vulkan::FrameStats::TakeGpuLoad();
+            Vulkan::FrameStats::TakeGpuWork();
+            Vulkan::FrameStats::TakeGpuThreadTime();
         } else {
             if (frame <= Stall) {
                 window_time += frame;
                 ++window_frames;
+            } else {
+                ++window_stalls;
             }
             if (now - window_start >= Window) {
                 Decide(now, fixed);
@@ -306,6 +457,9 @@ public:
             .pace = pace,
             .slot = pace * refresh,
             .load = summary_windows != 0 ? summary_load / summary_windows : 0.0,
+            .next_cost = sizing && level >= FirstHeadsetLevel && level < largest
+                             ? cost[level + 1] / cost[level] * markup[level + 1] / markup[level]
+                             : 0.0,
         };
         summary_load = 0.0;
         summary_windows = 0;
@@ -313,34 +467,123 @@ public:
     }
 
 private:
+    /// What frames took, and the GPU thread's processor time a frame, when a try at a pace
+    /// failed with the GPU resting often enough: the title's own work did not fit it.
+    struct OwnWork {
+        double taken{};
+        double thread{};
+        Clock::time_point at{};
+    };
+
     void Decide(Clock::time_point now, s32 fixed) {
         const float load = Vulkan::FrameStats::TakeGpuLoad();
+        const float clocked = Vulkan::FrameStats::TakeGpuWork();
+        const double thread = Vulkan::FrameStats::TakeGpuThreadTime();
         const u32 frames = window_frames;
+        const u32 stalls = window_stalls;
         const double taken = frames != 0 ? window_time / frames : 0.0;
         window_start = now;
         window_time = 0.0;
         window_frames = 0;
-        if (load < 0.0f || frames < FewestFrames) {
-            // Loading, or nothing drawn: nothing to go by.
+        window_stalls = 0;
+        sizing = fixed == 0;
+        const bool idle = load < 0.0f || frames < FewestFrames;
+        if (idle || stalls != 0) {
+            // Loading, nothing drawn, or a frame that held everything up for long (the GPU
+            // rested through it, and what it was busy with is not what frames take): nothing to
+            // go by. Nor does what comes after it say what a step of size made before it cost.
             tight_windows = 0;
             faster_windows = 0;
+            up_windows = 0;
+            watched.reset();
+            level_windows = 0;
+            if (!idle) {
+                return;
+            }
+            if (++idle_windows == NewScene) {
+                // A scene loaded for long, with nothing drawn, is another one: what the last one
+                // taught of the sizes is not this one's, nor is a step up that fitted it. And it
+                // starts at the console's smallest size at most: one the last scene had room
+                // for may be far too much for this one, and frames that come late at its start
+                // are seen. (A title that loads while it goes on drawing, as Astro Bot does
+                // between its levels, is not caught by this.)
+                markup.fill(1.0);
+                cost = SizeCost;
+                patience = FirstPatience;
+                went_up = {};
+                up_allowed = now + SettleUp;
+                up_windows = 0;
+                if (sizing && level > UsualLevel) {
+                    Change(UsualLevel, now, taken, load, false, false);
+                }
+            }
             return;
         }
+        idle_windows = 0;
         summary_load += std::min(load, 1.0f);
         ++summary_windows;
+        // For the log.
+        window_work = clocked >= 0.0f ? std::min(clocked, load) : -1.0f;
+        window_thread = thread;
 
         const bool sized = fixed == 0;
-        const bool paced = fixed_pace == 0;
+        // (Frames held to a steady rate: the pace is not this one's to choose.)
+        const bool paced = fixed_pace == 0 && steady_fps == 0.0;
         const double slot = pace * refresh;
-        // How long the GPU worked on a frame (at least: one that never rests may have more to
-        // do than it gets done).
-        const double gpu = std::min(load, 1.0f) * taken;
+        // How long the GPU worked on a frame, at the fastest clock it was seen to run at where
+        // its clock is known (at least: one that never rests may have more to do than it gets
+        // done).
+        const float work = clocked >= 0.0f ? std::min(clocked, load) : load;
+        const double gpu = std::min(work, 1.0f) * taken;
         const auto since_change = now - changed;
-        const auto cost_at = [&](s32 other) { return gpu * cost[other] / cost[level]; };
+        // The GPU's work a frame at this size and pace over the windows since it was taken, for
+        // what a step from it teaches (the window that asks for a step is the least like the
+        // rest: averaged in with a quarter's weight).
+        if (level_windows == 0 || level != level_of_average || pace != pace_of_average) {
+            level_average = gpu;
+            level_of_average = level;
+            pace_of_average = pace;
+            level_windows = 1;
+        } else {
+            level_average += (gpu - level_average) * 0.25;
+            ++level_windows;
+        }
+        if (watched && watched->to == level) {
+            if (load < LearningLoad) {
+                // The GPU rests too much for a step of size to show what it costs.
+                watched.reset();
+            } else if (!watched->settled) {
+                // Frames drawn at the old size are still in the first window after the step.
+                watched->settled = true;
+            } else {
+                watched->after += gpu;
+                if (++watched->windows == StepWindows) {
+                    Learn();
+                }
+            }
+        }
+        // What another size would cost the GPU, from what this one does.
+        const auto cost_at = [&](s32 other) {
+            return gpu * cost[other] / cost[level] * markup[other] / markup[level];
+        };
+        // The same where a faster pace is weighed, a smaller size counted as saving little: a
+        // faster pace that does not hold costs more than one not tried.
+        const auto cautious_cost_at = [&](s32 other) {
+            if (other >= level) {
+                return cost_at(other);
+            }
+            return std::max(cost_at(other), gpu * CautiousSmallerCost[other] /
+                                                 CautiousSmallerCost[level] * markup[other] /
+                                                 markup[level]);
+        };
         // The slowest pace frames are ever held to, and the smallest size wanted at a pace.
         const s32 slowest = std::max(std::max(2, fastest), static_cast<s32>(SlowestWanted / refresh));
         const auto smallest_at = [&](s32 refreshes_given) {
-            return !paced || refreshes_given >= slowest ? FirstHeadsetLevel : UsualLevel;
+            return std::min(!paced || refreshes_given >= slowest ||
+                                    refreshes_given * refresh >= SmallestSizeSlot
+                                ? FirstHeadsetLevel
+                                : UsualLevel,
+                            largest);
         };
         // The largest size that fits a pace with room to spare, if any does.
         const auto largest_fitting = [&](s32 refreshes_given, s32 from, s32 down_to) {
@@ -362,12 +605,13 @@ private:
             patience = FirstPatience;
         }
         if (now - last_pace_regret > std::max<Clock::duration>(4 * pace_patience, Calm)) {
-            pace_patience = FirstPatience;
+            pace_patience = FirstPacePatience;
         }
 
         if (taken > slot * (1.0 + Over)) {
             // Frames do not fit the refreshes they are given: the title is on its own pace.
             faster_windows = 0;
+            up_windows = 0;
             ++tight_windows;
             if (tight_windows < 2 || since_change < SettleDown) {
                 return;
@@ -377,38 +621,68 @@ private:
             const bool gpu_short = load > GpuShort;
             const auto slower = [&](s32 to) {
                 if (now - went_faster < PaceRegret) {
-                    // The faster pace was a mistake.
+                    // The faster pace was a mistake: the next try waits longer, and where the
+                    // GPU was not what held frames up, what the title's own work took at that
+                    // pace is kept in mind.
                     pace_patience = std::min(pace_patience * 2, LongestPatience);
                     last_pace_regret = now;
-                    if (pace == 1) {
-                        // Left to itself, as it was: this is what the title's own work takes.
-                        own_time = taken;
+                    if (!gpu_short) {
+                        own_work[pace] = {.taken = taken, .thread = thread, .at = now};
                     }
                 }
                 SetPace(to, now, taken, load);
                 went_faster = {};
                 faster_allowed = now + pace_patience;
             };
-            if (sized && gpu_short && (level > smallest_at(pace) || (paced && pace < slowest))) {
-                if (now - went_up < Regret) {
-                    // The step up was a mistake: that size costs more than was thought.
-                    patience = std::min(patience * 2, LongestPatience);
-                    for (s32 size = level; size <= LastHeadsetLevel; ++size) {
-                        cost[size] *= Dearer;
-                    }
-                    last_regret = now;
+            if (sized && gpu_short && now - went_up < Regret && level > size_before_up) {
+                // The step up was a mistake: back to the size that fitted, at this pace, and
+                // that size counts as dearer from now on (and so do the larger ones).
+                patience = std::min(patience * 2, LongestPatience);
+                for (s32 size = level; size <= LastHeadsetLevel; ++size) {
+                    markup[size] = std::min(markup[size] * Dearer, DearestMarkup);
                 }
+                last_regret = now;
+                Change(size_before_up, now, taken, load, false, false);
+                went_up = {};
+                up_allowed = now + patience;
+                tight_windows = 0;
+                return;
+            }
+            if (sized && gpu_short && (level > smallest_at(pace) || (paced && pace < slowest))) {
                 // Straight to what the GPU's time says will do: the largest size that fits
-                // this pace, or the next pace down and the largest that fits that. (A GPU
+                // this pace, or the pace at which the smallest size wanted fits and the largest
+                // that fits that. Judged by the time the GPU really took: one that runs slower
+                // than it did (warm, or held back by the system) takes longer than its work at
+                // the fastest clock, and the frames that do not fit are what counts. (A GPU
                 // that never rests may need more than it is seen to take; then this comes
                 // round again.)
+                const double gpu_now = std::max(gpu, static_cast<double>(std::min(load, 1.0f)) *
+                                                         taken);
+                const auto cost_now_at = [&](s32 other) {
+                    return gpu_now * cost[other] / cost[level] * markup[other] / markup[level];
+                };
+                const auto largest_fitting_now = [&](s32 refreshes_given, s32 from, s32 down_to) {
+                    for (s32 size = from; size > down_to; --size) {
+                        if (cost_now_at(size) * (1.0 + SizeMargin) <= refreshes_given * refresh) {
+                            return size;
+                        }
+                    }
+                    return down_to;
+                };
                 const s32 smallest = smallest_at(pace);
-                s32 size = level > smallest ? largest_fitting(pace, level - 1, smallest) : level;
-                const bool fits = cost_at(size) * (1.0 + SizeMargin) <= slot;
+                s32 size = level > smallest ? largest_fitting_now(pace, level - 1, smallest) : level;
+                // (The size frames are drawn at does not fit: that is what this is about.)
+                const bool fits =
+                    size != level && cost_now_at(size) * (1.0 + SizeMargin) <= slot;
                 const bool other_pace = !fits && paced && pace < slowest;
                 if (other_pace) {
-                    slower(pace + 1);
-                    size = largest_fitting(pace, level, smallest_at(pace));
+                    s32 to = pace + 1;
+                    while (to < slowest &&
+                           cost_now_at(smallest_at(to)) * (1.0 + SizeMargin) > to * refresh) {
+                        ++to;
+                    }
+                    slower(to);
+                    size = largest_fitting_now(pace, level, smallest_at(pace));
                 }
                 if (size != level) {
                     Change(size, now, taken, load, other_pace);
@@ -428,40 +702,98 @@ private:
         }
         tight_windows = 0;
 
-        // A faster pace, when the smallest size wanted for it would fit with room to spare.
-        // (Whether the title's own work fits it as well only shows when it is tried.)
-        // (A frame for every refresh is not tried again for long where the title's own work was
-        // seen not to fit one, as on a display that refreshes faster than the title can draw
-        // whatever its size: every try is a few seconds of frames that come unevenly.)
-        const bool own_fits = pace != 2 || own_time == 0.0 ||
-                              own_time * (1.0 + Over) <= refresh || now - last_pace_regret > Forget;
-        if (paced && pace > fastest && now > faster_allowed && own_fits) {
-            const s32 smallest = sized ? smallest_at(pace - 1) : level;
-            if (cost_at(smallest) * (1.0 + PaceMargin) <= (pace - 1) * refresh) {
+        // A faster pace, when all a frame takes would fit it with room to spare, and has for a
+        // while: the GPU's work at the smallest size wanted for it, the GPU thread's processor
+        // time, and the title's own work where a try at that pace found it too much.
+        if (paced && pace > fastest && now > faster_allowed) {
+            const s32 to = pace - 1;
+            const double faster_slot = to * refresh;
+            const s32 smallest = sized ? smallest_at(to) : level;
+            if (cautious_cost_at(smallest) * (1.0 + PaceMargin) <= faster_slot &&
+                thread * (1.0 + PaceMargin) <= faster_slot && OwnWorkFits(to, now, thread)) {
                 if (++faster_windows >= FasterWindows && since_change > SettleUp) {
                     faster_windows = 0;
-                    const s32 size = sized ? largest_fitting(pace - 1, level, smallest) : level;
-                    SetPace(pace - 1, now, taken, load);
+                    const s32 size = sized ? largest_fitting(to, level, smallest) : level;
+                    SetPace(to, now, taken, load);
                     if (size != level) {
                         Change(size, now, taken, load, true);
                     }
                     went_up = {};
                     went_faster = now;
+                    // The picture grows only once the faster pace has held.
+                    up_allowed = std::max(up_allowed, now + PaceRegret);
                 }
                 return;
             }
         }
         faster_windows = 0;
-        // A larger picture, when it would fit the pace with room to spare.
-        if (sized && level < LastHeadsetLevel && since_change > SettleUp && now > up_allowed &&
-            cost_at(level + 1) * (1.0 + SizeMargin) <= slot) {
+        // A larger picture, when it would have fitted the pace with a fifth to spare for a few
+        // seconds in a row (a view that is lighter for a moment is no reason), up to the
+        // largest allowed.
+        if (sized && level < largest && cost_at(level + 1) * (1.0 + SizeUpMargin) <= slot) {
+            ++up_windows;
+        } else {
+            up_windows = 0;
+        }
+        if (up_windows >= UpWindows && since_change > UpSettle && now > up_allowed) {
+            size_before_up = level;
             Change(level + 1, now, taken, load);
             went_up = now;
+            up_windows = 0;
         }
     }
 
-    /// `paced`: the size goes with a pace that has just changed.
-    void Change(s32 to, Clock::time_point now, double taken, float load, bool paced = false) {
+    /// Whether the title's own work may fit `to` refreshes: no try at that pace failed for it,
+    /// or long ago, or the scene is clearly lighter for the GPU thread than it was then.
+    bool OwnWorkFits(s32 to, Clock::time_point now, double thread) const {
+        const OwnWork& seen = own_work[to];
+        if (seen.taken == 0.0 || now - seen.at > Forget) {
+            return true;
+        }
+        return seen.thread > 0.0 && thread > 0.0 && thread < seen.thread * Lighter;
+    }
+
+    /// What a step of size that is watched showed it to cost, against what it was counted as,
+    /// for the log. (It does not change what sizes are counted as costing: while the player
+    /// moves, a step shows as much of the view changing as of the size.)
+    void Learn() {
+        const Step step = *watched;
+        watched.reset();
+        const double after = step.windows != 0 ? step.after / step.windows : 0.0;
+        // (The work is counted at the fastest clock seen: if that rose meanwhile, before and
+        // after are counted at different ones.)
+        if (step.before <= 0.0 || after <= 0.0 ||
+            step.clock != Vulkan::FrameStats::FastestGpuClock()) {
+            return;
+        }
+        const s32 upper = std::max(step.from, step.to);
+        const double seen = upper == step.to ? after / step.before : step.before / after;
+        const double counted = cost[upper] / cost[upper - 1];
+        const double pixels = static_cast<double>(ConsoleSizes[upper][0]) * ConsoleSizes[upper][1] /
+                              (static_cast<double>(ConsoleSizes[upper - 1][0]) *
+                               ConsoleSizes[upper - 1][1]);
+        // Never cheaper than the smaller size, never dearer than its pixels.
+        (void)pixels;
+        LOG_INFO(Core, "Going from {} to {} cost the GPU {:.2f} times the work of {} (counted as "
+                       "{:.2f})",
+                 SizeName(upper - 1), SizeName(upper), seen, SizeName(upper - 1), counted);
+    }
+
+    /// `paced`: the size goes with a pace that has just changed. `watch`: what the step costs
+    /// is to be learned from it.
+    void Change(s32 to, Clock::time_point now, double taken, float load, bool paced = false,
+                bool watch = true) {
+        if (watched) {
+            // Taken back before it was seen for long: what was seen counts.
+            Learn();
+        }
+        if (watch && !paced && std::abs(to - level) == 1 && load >= LearningLoad &&
+            level_windows >= 3 && level_of_average == level && pace_of_average == pace) {
+            watched = Step{.from = level,
+                           .to = to,
+                           .before = level_average,
+                           .clock = Vulkan::FrameStats::FastestGpuClock()};
+        }
         if (paced) {
             LOG_INFO(Core,
                      "The scene is drawn at {} an eye from now on instead of {}: the largest "
@@ -471,23 +803,34 @@ private:
             LOG_INFO(Core,
                      "The scene is drawn at {} an eye from now on instead of {}, which is {} for "
                      "the {:.1f} ms frames are given: they took {:.1f} ms, with the GPU busy "
-                     "{:.0f}% of the time",
+                     "{:.0f}% of the time{}",
                      SizeName(to), SizeName(level),
                      to < level ? "too much" : "less than there is room", pace * refresh * 1e3,
-                     taken * 1e3, load * 100.0f);
+                     taken * 1e3, load * 100.0f, AtClock());
         }
         level = to;
         changed = now;
+        up_windows = 0;
     }
 
     void SetPace(s32 to, Clock::time_point now, double taken, float load) {
+        watched.reset();
         LOG_INFO(Core,
                  "Frames are given {} refreshes from now on ({:.0f} a second), {} was {}: frames "
-                 "took {:.1f} ms at {}, the GPU was busy {:.0f}% of the time",
+                 "took {:.1f} ms at {}, the GPU was busy {:.0f}% of the time{}, the GPU thread "
+                 "{:.1f} ms a frame",
                  to, 1.0 / (to * refresh), pace, to > pace ? "too few" : "more than needed",
-                 taken * 1e3, SizeName(level), load * 100.0f);
+                 taken * 1e3, SizeName(level), load * 100.0f, AtClock(), window_thread * 1e3);
         pace = to;
         changed = now;
+        up_windows = 0;
+    }
+
+    /// " (N% at its fastest clock)" where the clock is known, for the log.
+    std::string AtClock() const {
+        return window_work >= 0.0f
+                   ? fmt::format(" ({:.0f}% at its fastest clock)", window_work * 100.0f)
+                   : std::string{};
     }
 
     /// The console's smallest size in most levels.
@@ -495,59 +838,121 @@ private:
     /// Frames are never held to a pace slower than this (in seconds a frame): a title that
     /// cannot make it either is left to draw as fast as it can.
     static constexpr double SlowestWanted = 0.0345;
+    /// Frames given at least this long (30 a second) may have the smallest size of all; frames
+    /// given less have the console's smallest at least.
+    static constexpr double SmallestSizeSlot = 0.030;
     /// A display whose refreshes are further apart than this refreshes no faster than the
     /// title draws.
     static constexpr double SlowDisplay = 1.0 / 65.0;
     static constexpr auto Window = std::chrono::milliseconds{500};
     static constexpr u32 FewestFrames = 5;
     static constexpr auto SettleDown = std::chrono::milliseconds{900};
-    static constexpr auto SettleUp = std::chrono::milliseconds{2400};
-    static constexpr auto Regret = std::chrono::seconds{8};
+    static constexpr auto SettleUp = std::chrono::seconds{6};
+    /// No larger picture this soon after any change of size or pace.
+    static constexpr auto UpSettle = std::chrono::seconds{10};
+    /// A step down this soon after a step up takes the step up back: it was a mistake.
+    static constexpr auto Regret = std::chrono::seconds{30};
     static constexpr auto PaceRegret = std::chrono::seconds{15};
     static constexpr auto Calm = std::chrono::seconds{90};
-    static constexpr auto FirstPatience = std::chrono::seconds{6};
+    static constexpr auto FirstPatience = std::chrono::seconds{15};
+    /// What the first failed try at a faster pace makes the next one wait (each one after
+    /// that doubles it).
+    static constexpr auto FirstPacePatience = std::chrono::seconds{20};
     static constexpr auto LongestPatience = std::chrono::seconds{120};
     static constexpr auto Forget = std::chrono::minutes{10};
-    static constexpr u32 FasterWindows = 4;
+    /// Windows in a row in which a faster pace would fit before it is tried: five seconds.
+    static constexpr u32 FasterWindows = 10;
     /// By how much of what they are given frames may take longer, on average, and still count
     /// as fitting: frames that fit take exactly what they are given.
     static constexpr double Over = 0.03;
     /// The share of the time the GPU must be busy to be what holds frames up.
     static constexpr float GpuShort = 0.85f;
-    /// Room a larger size, and a faster pace, must leave.
-    static constexpr double SizeMargin = 0.15;
-    static constexpr double PaceMargin = 0.10;
-    /// What a size that had to be taken back is counted as costing more.
+    /// Room the size chosen for a pace must leave, a step up to a larger size, and a faster
+    /// pace. (A step up that does not fit is taken back within seconds, a faster pace that does
+    /// not costs more: see Regret and PaceRegret.)
+    static constexpr double SizeMargin = 0.10;
+    static constexpr double SizeUpMargin = 0.20;
+    /// Windows in a row in which a larger picture would have fitted before it is taken: four
+    /// seconds.
+    static constexpr u32 UpWindows = 8;
+    static constexpr double PaceMargin = 0.25;
+    /// What a size that had to be taken back is counted as costing more, and the most that
+    /// adds up to.
     static constexpr double Dearer = 1.06;
+    static constexpr double DearestMarkup = 1.2;
+    /// Windows in a row with nothing to go by after which the title is taken to be in another
+    /// scene: two seconds of loading.
+    static constexpr u32 NewScene = 4;
+    /// A step of size is seen (for the log) in two windows after the first one after it
+    /// (frames drawn at the old size are through the GPU by then), where the GPU is busy at
+    /// least this much of the time (resting more, it shows nothing of what a size costs).
+    static constexpr u32 StepWindows = 2;
+    static constexpr float LearningLoad = 0.5f;
+    /// A scene this much lighter for the GPU thread than one in which the title's own work did
+    /// not fit a pace is worth another try at it.
+    static constexpr double Lighter = 0.8;
 
     const s32 fixed_pace;
     const s32 fastest_pace;
     const double fps_cap;
+    const double steady_fps;
+    /// The largest size chosen here.
+    const s32 largest;
     s32 fastest{2};
     bool started{};
     s32 level{UsualLevel};
     s32 pace;
     double refresh{1.0 / 120.0};
-    // GPU time of a frame at each size, in terms of the smallest (measured on the headset with
-    // the GPU as the limit; a size that proves dearer is marked up).
-    std::array<double, 7> cost{1.0, 1.0, 1.0, 1.0, 1.08, 1.27, 1.54};
+    // What each size has been found to cost more than counted (a size that had to be taken
+    // back, and the ones larger than it).
+    std::array<double, 7> markup{1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    // What each size's GPU work is counted as, in terms of the smallest (SizeCost).
+    std::array<double, 7> cost{SizeCost};
+    // A step of size whose cost is being watched: the GPU's work a frame before it, and the
+    // sum of it over the windows seen after it.
+    struct Step {
+        s32 from{};
+        s32 to{};
+        double before{};
+        double after{};
+        u32 windows{};
+        bool settled{};
+        u32 clock{};
+    };
+    std::optional<Step> watched;
+    // The GPU's work a frame at the present size and pace, averaged over the windows since it
+    // was taken (level_windows of them), for what a step from it teaches.
+    double level_average{};
+    s32 level_of_average{};
+    s32 pace_of_average{};
+    u32 level_windows{};
+    // Frames that held everything up in the present window; whether the size is chosen here.
+    u32 window_stalls{};
+    bool sizing{};
     Clock::time_point window_start;
     double window_time{};
     u32 window_frames{};
     u32 tight_windows{};
     u32 faster_windows{};
+    u32 up_windows{};
+    u32 idle_windows{};
     Clock::time_point changed;
     Clock::time_point up_allowed;
     Clock::time_point faster_allowed;
     Clock::time_point last_regret;
     Clock::time_point last_pace_regret;
     std::chrono::seconds patience{FirstPatience};
-    std::chrono::seconds pace_patience{FirstPatience};
-    // What frames took when one refresh each was last found to be too few for them.
-    double own_time{};
-    // When the size last went up and the pace last got faster, if that still stands.
+    std::chrono::seconds pace_patience{FirstPacePatience};
+    std::array<OwnWork, SlowestPace + 1> own_work{};
+    // When the size last went up (and from what) and the pace last got faster, if that still
+    // stands.
     Clock::time_point went_up;
+    s32 size_before_up{UsualLevel};
     Clock::time_point went_faster;
+    // The last window's GPU work at the fastest clock (below zero where not known) and GPU
+    // thread's time a frame, for the log.
+    float window_work{-1.0f};
+    double window_thread{};
     double summary_load{};
     u32 summary_windows{};
 };
@@ -780,7 +1185,8 @@ void OnFrameSubmitted() {
     static bool running = false;
     static Clock::time_point last;
     static TimeStep time_step;
-    static Governor governor{settings.pace, settings.fastest_pace, settings.fps_cap};
+    static Governor governor{settings.pace, settings.fastest_pace, settings.fps_cap,
+                             settings.steady_fps, settings.largest_level};
     // For the log.
     static Clock::time_point report_time;
     static double report_real = 0.0;
@@ -796,11 +1202,17 @@ void OnFrameSubmitted() {
                  "The title's time step {}; the size of its scene is {}; the refreshes a frame "
                  "is given are {}",
                  settings.time_step ? "follows what its frames take" : "is left alone",
-                 settings.resolution == Settings::Resolution::Title    ? "left to the title"
-                 : settings.resolution == Settings::Resolution::Pinned ? "held to one"
-                                                                       : "chosen by how busy the "
-                                                                         "GPU is",
-                 settings.pace == 0 ? "chosen by what the title manages" : "one number");
+                 settings.resolution == Settings::Resolution::Title
+                     ? std::string{"left to the title"}
+                 : settings.resolution == Settings::Resolution::Pinned ? std::string{"held to one"}
+                 : settings.largest_level < LastHeadsetLevel
+                     ? fmt::format("chosen by how busy the GPU is, {} at most",
+                                   SizeName(settings.largest_level))
+                     : std::string{"chosen by how busy the GPU is"},
+                 settings.pace != 0 ? std::string{"one number"}
+                 : settings.steady_fps > 0.0
+                     ? fmt::format("as many as make {:.0f} frames a second", settings.steady_fps)
+                     : std::string{"chosen by what the title manages"});
         return;
     }
     const double frame = std::chrono::duration<double>(now - last).count();
@@ -811,15 +1223,67 @@ void OnFrameSubmitted() {
     case Settings::Resolution::Title:
         governor.Level(frame, now, Governor::NotMine);
         break;
-    case Settings::Resolution::Pinned:
-        wanted = governor.Level(frame, now, settings.pinned_level);
+    case Settings::Resolution::Pinned: {
+        // A measuring aid: SHADPS4_DBG_RESOLUTION_CYCLE=<seconds> has the pinned size and the
+        // next larger take turns, so that what a change of size does to a frame can be seen.
+        static const double cycle = [] {
+            const char* value = std::getenv("SHADPS4_DBG_RESOLUTION_CYCLE");
+            return value != nullptr ? std::atof(value) : 0.0;
+        }();
+        static const auto cycle_start = now;
+        s32 pinned = settings.pinned_level;
+        if (cycle > 0.0 &&
+            static_cast<s64>(std::chrono::duration<double>(now - cycle_start).count() / cycle) %
+                    2 ==
+                1) {
+            pinned = std::min(pinned + 1, LastHeadsetLevel);
+        }
+        // The same by the A/B measuring aid, as "size": the "B" frames are drawn a size larger.
+        if (Vulkan::FrameStats::AbOff("size")) {
+            pinned = std::min(settings.pinned_level + 1, LastHeadsetLevel);
+        }
+        // SHADPS4_DBG_TRACE_SIZE_CHANGE=<s>[,<frames>]: the draws from so many frames after the
+        // first change of size that many seconds in are traced (issue #19).
+        {
+            static s32 trace_delay = 0;
+            static const double trace_after = [] {
+                const char* value = std::getenv("SHADPS4_DBG_TRACE_SIZE_CHANGE");
+                if (value == nullptr) {
+                    return -1.0;
+                }
+                if (const char* comma = std::strchr(value, ','); comma != nullptr) {
+                    trace_delay = std::atoi(comma + 1);
+                }
+                return std::atof(value);
+            }();
+            static s32 last_pinned = pinned;
+            static bool traced = false;
+            static s32 countdown = -1;
+            if (pinned != last_pinned && !traced && trace_after >= 0.0 &&
+                std::chrono::duration<double>(now - cycle_start).count() >= trace_after) {
+                traced = true;
+                countdown = trace_delay;
+                LOG_INFO(Core, "TRACE size change to level {}", pinned);
+            }
+            if (countdown >= 0 && countdown-- == 0) {
+                LOG_INFO(Core, "TRACE from {} frames after the size change", trace_delay);
+                Vulkan::Rasterizer::StartDrawTrace(7000);
+            }
+            last_pinned = pinned;
+        }
+        wanted = governor.Level(frame, now, pinned);
         break;
+    }
     case Settings::Resolution::Governed:
         wanted = governor.Level(frame, now, 0);
         break;
     }
     const s32 resolution = TendResolution(base, *build, wanted);
     frame_pace.store(governor.Pace(), std::memory_order_relaxed);
+    if (resolution >= FirstHeadsetLevel) {
+        const auto& size = GetLarger().sizes[resolution];
+        scene_size.store(size[0] << 16 | size[1], std::memory_order_relaxed);
+    }
 
     if (settings.time_step) {
         // Shorter steps than the title's own only where it is made to draw faster than it
@@ -843,11 +1307,15 @@ void OnFrameSubmitted() {
                  "The title's clock: frames take {:.1f} ms, its time step is {:.1f} ms, the game "
                  "ran at {:.0f}% of its speed over the last {:.0f} s (it would have at {:.0f}% "
                  "left to itself); it draws the scene at {} an eye and is given {} refreshes a "
-                 "frame ({:.1f} ms), the GPU busy {:.0f}% of the time",
+                 "frame ({:.1f} ms), the GPU busy {:.0f}% of the time{}",
                  report_real / report_frames * 1e3, step * 1e3, 100.0 * stepped / report_real,
                  report_real, 100.0 * Nominal * report_frames / report_real,
                  SizeName(resolution),
-                 summary.pace, summary.slot * 1e3, summary.load * 100.0);
+                 summary.pace, summary.slot * 1e3, summary.load * 100.0,
+                 summary.next_cost > 0.0
+                     ? fmt::format(" (the next size up counted as {:.2f} times the work)",
+                                   summary.next_cost)
+                     : std::string{});
         if (const std::string seen = physics_watch.TakeSummary(); !seen.empty()) {
             LOG_INFO(Core, "{}", seen);
         }
@@ -855,6 +1323,14 @@ void OnFrameSubmitted() {
         report_real = 0.0;
         report_frames = 0;
     }
+}
+
+bool IsEyeSize(u32 width, u32 height) {
+    if (known_build.load(std::memory_order_acquire) == nullptr) {
+        return false;
+    }
+    const auto& size = GetLarger().sizes[LastHeadsetLevel];
+    return width == size[0] && height == size[1];
 }
 
 u32 FramePace() {
@@ -930,6 +1406,121 @@ void OnGameLoaded(VAddr base, u64 size) {
     }
     known_base = base;
     known_build.store(build, std::memory_order_release);
+}
+
+bool IsSceneSize(u32 width, u32 height) {
+    const u32 size = scene_size.load(std::memory_order_relaxed);
+    return size != 0 && width == size >> 16 && height == (size & 0xffff);
+}
+
+bool IsHeadsetSceneSize(u32 width, u32 height) {
+    if (known_build.load(std::memory_order_acquire) == nullptr) {
+        return false;
+    }
+    const auto& sizes = GetLarger().sizes;
+    for (s32 level = FirstHeadsetLevel; level <= LastHeadsetLevel; ++level) {
+        if (width == sizes[level][0] && height == sizes[level][1]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsSceneEnlargement(u64 pgm_hash) {
+    // The same program in versions 1.00 and 1.04 (traced on the headset and on the PC).
+    static constexpr u64 FinalPass = 0x2ed5e2b0;
+    return pgm_hash == FinalPass && known_build.load(std::memory_order_acquire) != nullptr;
+}
+
+std::filesystem::path SceneFile(std::string_view guest_path, std::filesystem::path host_path) {
+    if (!guest_path.ends_with(".spx") || !guest_path.starts_with("/app0/")) {
+        return host_path;
+    }
+    const Scenes::Detail& detail = GetSettings().scene_detail;
+    if (detail.IsTitles() || known_build.load(std::memory_order_acquire) == nullptr) {
+        return host_path;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::filesystem::path> made;
+    std::scoped_lock lock{mutex};
+    const std::string key = host_path.string();
+    if (const auto found = made.find(key); found != made.end()) {
+        return found->second;
+    }
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(host_path, error)) {
+        return host_path;
+    }
+    std::ifstream in{host_path, std::ios::binary};
+    const std::string text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    if (!in.good() && !in.eof()) {
+        return host_path;
+    }
+    // A copy for every file the title has, by where it was found: an update's file of the
+    // same name is another one.
+    const std::filesystem::path folder =
+        Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "CUSA12392-scenes";
+    std::filesystem::create_directories(folder, error);
+    const std::filesystem::path copy =
+        folder / fmt::format("{:016x}-{}", std::hash<std::string>{}(key),
+                             host_path.filename().string());
+    const std::string name = host_path.filename().string();
+    const bool base = name == "default_hmd.spx";
+    const std::string adjusted = Scenes::Adjust(text, detail, base, name);
+    if (adjusted == text) {
+        // Nothing to change: the title's own file.
+        made.emplace(key, host_path);
+        return host_path;
+    }
+    {
+        // Written beside it first and put in its place once all of it is out: a copy that could
+        // not be written whole (a full disk) is never what the title reads.
+        std::filesystem::path partial = copy;
+        partial += ".part";
+        std::ofstream out{partial, std::ios::binary | std::ios::trunc};
+        out.write(adjusted.data(), static_cast<std::streamsize>(adjusted.size()));
+        out.close();
+        if (out.fail()) {
+            std::filesystem::remove(partial, error);
+        } else {
+            std::filesystem::rename(partial, copy, error);
+        }
+        if (out.fail() || error) {
+            LOG_WARNING(Core, "The scene parameters {} could not be written changed to {}: the "
+                              "title's are read",
+                        host_path.filename().string(), copy.string());
+            made.emplace(key, host_path);
+            return host_path;
+        }
+    }
+    // What was asked of this file (the reach of the depth pre-pass only goes into the base).
+    std::string changes;
+    const auto add = [&](std::string what) {
+        changes += (changes.empty() ? "" : ", ") + std::move(what);
+    };
+    if (detail.lod_scale != 1.0) {
+        add(fmt::format("models changing to coarser forms at {:.0f}% of the title's distances",
+                        detail.lod_scale * 100.0));
+    }
+    if (detail.shadow_map_size != 0) {
+        add(fmt::format("shadow maps of {} at most", detail.shadow_map_size));
+    }
+    if (!detail.depth_prepass) {
+        add("no depth pre-pass");
+    } else if (base && detail.prepass_distance >= 0.0) {
+        add(fmt::format("the depth pre-pass to {} m", detail.prepass_distance));
+    }
+    if (detail.depth_prepass && base && detail.prepass_radius >= 0.0) {
+        add(fmt::format("the depth pre-pass for models from {} m across", detail.prepass_radius));
+    }
+    if (Scenes::LeavesSunShadowsOut(detail, name)) {
+        add(std::ranges::find(Scenes::MixedSunFiles, name) != std::end(Scenes::MixedSunFiles)
+                ? "no sun shadow maps (a measuring aid: part of the level has a sun)"
+                : "no sun shadow maps (the level's sun is black)");
+    }
+    LOG_INFO(Core, "The scene parameters {} are read with {}", name, changes);
+    made.emplace(key, copy);
+    return copy;
 }
 
 void NoteView(const Vr::Vec3& tracker_head) {

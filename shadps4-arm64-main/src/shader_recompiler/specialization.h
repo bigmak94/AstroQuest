@@ -135,6 +135,14 @@ struct StageSpecialization {
                              spec.element_size = sharp.element_size;
                          }
                      });
+        // The kind of a buffer slot with nothing valid bound to it as well: the descriptor
+        // bound there (BindBuffers) is of the kind the same question gives.
+        for (u32 i = 0; i < info->buffers.size(); ++i) {
+            if (!bitset[i]) {
+                const auto& desc = info->buffers[i];
+                buffers[i].is_storage = desc.IsStorage(desc.GetSharp(*info));
+            }
+        }
         ForEachSharp(binding, images, info->images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.type = desc.GetHostViewType(sharp);
@@ -233,6 +241,11 @@ struct StageSpecialization {
 
         u32 binding{};
         for (u32 i = 0; i < buffers.size(); i++) {
+            // Whether a slot is a storage or a uniform buffer, also where nothing valid is bound
+            // to it: the shader declares it so, and the binding has to be of the same kind.
+            if (buffers[i].is_storage != other.buffers[i].is_storage) {
+                return false;
+            }
             if (other.bitset[binding++] && buffers[i] != other.buffers[i]) {
                 return false;
             }

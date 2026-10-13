@@ -80,6 +80,8 @@ public:
     static constexpr uint32_t MenuLeft = 1;
     static constexpr uint32_t MenuRight = 2;
     static constexpr uint32_t MenuConfirm = 4;
+    static constexpr uint32_t MenuUp = 8;
+    static constexpr uint32_t MenuDown = 16;
 
     /// How long OPTIONS is held for the view to be reset, in seconds: as on a PlayStation VR.
     static constexpr double OptionsHold = 1.0;
@@ -253,7 +255,12 @@ public:
         }
         const float x = std::abs(touch.left_x) >= std::abs(touch.right_x) ? touch.left_x
                                                                            : touch.right_x;
-        return (x < -0.55f ? MenuLeft : 0) | (x > 0.55f ? MenuRight : 0) |
+        const float y = std::abs(touch.left_y) >= std::abs(touch.right_y) ? touch.left_y
+                                                                           : touch.right_y;
+        // The way a stick is pushed most is the one that counts; up is positive.
+        const bool sideways = std::abs(x) >= std::abs(y);
+        return (sideways && x < -0.55f ? MenuLeft : 0) | (sideways && x > 0.55f ? MenuRight : 0) |
+               (!sideways && y > 0.55f ? MenuUp : 0) | (!sideways && y < -0.55f ? MenuDown : 0) |
                (touch.a || touch.left_trigger > 0.6f || touch.right_trigger > 0.6f ? MenuConfirm
                                                                                     : 0);
     }

@@ -1289,6 +1289,23 @@ void EmitContext::DefineFunctions() {
         LOG_DEBUG(Render_Recompiler, "Shader {:#x} uses dynamic ReadConst", info.pgm_hash);
         read_const_dynamic = DefineReadConst(true);
     }
+
+    // A title's final pass is known to read one plain 2D picture of floating point colours, with
+    // one sampler: what reads anything else is left as it is.
+    if (stage == Stage::Fragment && runtime_info.fs_info.scene_upscale.least_scale > 1.0f) {
+        const bool plain = images.size() == 1 && samplers.size() == 1 &&
+                           images[0].view_type == AmdGpu::ImageType::Color2D &&
+                           !images[0].is_integer && !images[0].is_storage &&
+                           images[0].mip_fallback_mode == MipStorageFallbackMode::None;
+        if (plain) {
+            scene_easu = DefineSceneEasu();
+        } else {
+            LOG_WARNING(Render_Recompiler,
+                        "Shader {:#x} reads something else than one plain picture: it reads it "
+                        "as it asks, without FSR 1",
+                        info.pgm_hash);
+        }
+    }
 }
 
 } // namespace Shader::Backend::SPIRV

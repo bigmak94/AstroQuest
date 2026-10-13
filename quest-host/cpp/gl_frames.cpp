@@ -2,6 +2,7 @@
 
 #include "gl_frames.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include <android/hardware_buffer.h>
@@ -252,6 +253,95 @@ void FrameBlitter::Destroy() {
         glDeleteVertexArrays(1, &vertex_array);
         vertex_array = 0;
     }
+}
+
+bool GpuTimer::Create() {
+    const char* extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+    available = extensions != nullptr &&
+                std::strstr(extensions, "GL_EXT_disjoint_timer_query") != nullptr;
+    if (available) {
+        glGenQueries(Slots, queries);
+        // Reading the flag clears it: whatever happened before counts for nothing.
+        GLint disjoint = 0;
+        glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+    }
+    return available;
+}
+
+void GpuTimer::Destroy() {
+    if (available) {
+        glDeleteQueries(Slots, queries);
+        available = false;
+    }
+}
+
+void GpuTimer::Begin() {
+    if (!available) {
+        return;
+    }
+    Collect();
+    // A slot whose time is not known yet is not used again: that frame goes untimed.
+    timing = !pending[next];
+    if (timing) {
+        glBeginQuery(GL_TIME_ELAPSED_EXT, queries[next]);
+    }
+}
+
+void GpuTimer::End() {
+    if (!timing) {
+        return;
+    }
+    glEndQuery(GL_TIME_ELAPSED_EXT);
+    pending[next] = true;
+    next = (next + 1) % Slots;
+    timing = false;
+}
+
+void GpuTimer::Collect() {
+    float times[Slots];
+    uint32_t done = 0;
+    for (uint32_t slot = 0; slot < Slots; ++slot) {
+        if (!pending[slot]) {
+            continue;
+        }
+        GLuint ready = 0;
+        glGetQueryObjectuiv(queries[slot], GL_QUERY_RESULT_AVAILABLE, &ready);
+        if (ready == 0) {
+            continue;
+        }
+        pending[slot] = false;
+        GLuint nanoseconds = 0;
+        glGetQueryObjectuiv(queries[slot], GL_QUERY_RESULT, &nanoseconds);
+        times[done++] = static_cast<float>(nanoseconds) * 1e-6f;
+    }
+    if (done == 0) {
+        return;
+    }
+    // Whatever made the GPU's clock jump since it was last asked (a change of its frequency, a
+    // reset) leaves the times read now unusable. (Reading the flag clears it: once for all.)
+    GLint disjoint = 0;
+    glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+    if (disjoint != 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < done; ++i) {
+        sum_ms += times[i];
+        worst_ms = std::max(worst_ms, times[i]);
+        ++count;
+    }
+}
+
+GpuTimer::Summary GpuTimer::Take() {
+    Collect();
+    const Summary summary{
+        .mean_ms = count != 0 ? static_cast<float>(sum_ms / count) : 0.0f,
+        .worst_ms = worst_ms,
+        .count = count,
+    };
+    sum_ms = 0.0;
+    worst_ms = 0.0f;
+    count = 0;
+    return summary;
 }
 
 void FrameBlitter::Draw(GLuint texture, uint32_t width, uint32_t height, bool swap_red_blue,

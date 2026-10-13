@@ -99,6 +99,14 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// FindImage for a texture a shader reads or writes, `index` the binding of it (a mip level
+    /// where the shader has one binding for each), with `desc` filled in as for FindImage. What
+    /// an earlier draw that bound the same T# the same way was given, while no image has come
+    /// or gone since: most draws bind textures that a draw before them bound as well.
+    [[nodiscard]] ImageId FindTextureImage(const AmdGpu::Image& sharp,
+                                           const Shader::ImageResource& resource, u32 index,
+                                           ImageDesc& desc);
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
@@ -355,6 +363,15 @@ private:
         u64 registrations{};
     };
     std::array<FoundImage, 1024> found_images{};
+    /// What a texture binding was found to be (FindTextureImage).
+    struct FoundTexture {
+        std::array<u64, 4> sharp{};
+        u64 use{};
+        u64 registrations{};
+        ImageId image_id{};
+        ImageDesc desc{};
+    };
+    std::array<FoundTexture, 256> found_textures{};
     u64 registrations{1};
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;

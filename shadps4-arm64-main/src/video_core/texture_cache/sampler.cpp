@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
@@ -14,9 +18,25 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
     const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
                                    (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
                                     AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
+    // SHADPS4_MAX_ANISO=<n>: no more than n samples along a texture seen at a slant, whatever
+    // the title asks for (a measuring aid: what that filtering costs).
+    static const float aniso_cap = [] {
+        const char* value = std::getenv("SHADPS4_MAX_ANISO");
+        return value != nullptr ? std::max(1.0f, static_cast<float>(std::atof(value))) : 16.0f;
+    }();
     const float max_anisotropy =
-        anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f, instance.MaxSamplerAnisotropy())
+        anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f,
+                                       std::min(instance.MaxSamplerAnisotropy(), aniso_cap))
                           : 1.0f;
+    if (anisotropy_enable) {
+        // Which ratios a title asks for, the first few times each.
+        static std::array<std::atomic<u32>, 17> seen{};
+        const u32 ratio = std::clamp(static_cast<u32>(sampler.MaxAniso()), 1u, 16u);
+        if (const u32 count = ++seen[ratio]; count <= 3) {
+            LOG_INFO(Render_Vulkan, "A sampler with anisotropic filtering up to {}x (given {}x)",
+                     ratio, max_anisotropy);
+        }
+    }
     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);
     if (border_color == vk::BorderColor::eFloatCustomEXT &&
         !instance.IsCustomBorderColorSupported()) {

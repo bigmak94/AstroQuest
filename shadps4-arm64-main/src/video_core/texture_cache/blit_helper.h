@@ -47,8 +47,11 @@ public:
     /// Draws `source` into `dest`, both single sampled and of the given size, with the edges
     /// smoothed (host_shaders/resolve_aa.frag). The source has to be in a layout for reading
     /// in shaders and the destination in the one for colour attachments.
+    /// `fine_only`: edges are smoothed only where an eye's scene is shaded pixel by pixel
+    /// (Vulkan::Foveation), for a target of the size the scene is drawn at.
     void SmoothInto(u32 width, u32 height, vk::Format src_pixel_format, vk::Format dst_pixel_format,
-                    vk::Image source, u32 src_layer, vk::Image dest, u32 dst_layer);
+                    vk::Image source, u32 src_layer, vk::Image dest, u32 dst_layer,
+                    bool fine_only = false);
 
 private:
     void CreateShaders();
@@ -63,7 +66,7 @@ private:
     };
     void CreateColorToMSDepthPipeline(const MsPipelineKey& key);
     void CreateMsCopyPipeline(const MsPipelineKey& key);
-    vk::Pipeline SmoothPipeline(vk::Format attachment_format);
+    vk::Pipeline SmoothPipeline(vk::Format attachment_format, bool fine_only);
 
 private:
     const Vulkan::Instance& instance;
@@ -93,7 +96,10 @@ private:
     vk::UniquePipelineLayout sampled_texture_pl_layout;
     vk::UniqueSampler linear_sampler;
     vk::ShaderModule resolve_aa_frag;
+    /// The same, smoothing only the finely shaded middle; null without foveation.
+    vk::ShaderModule resolve_aa_fine_frag;
     std::vector<std::pair<vk::Format, vk::UniquePipeline>> resolve_aa_pl;
+    std::vector<std::pair<vk::Format, vk::UniquePipeline>> resolve_aa_fine_pl;
 };
 
 } // namespace VideoCore

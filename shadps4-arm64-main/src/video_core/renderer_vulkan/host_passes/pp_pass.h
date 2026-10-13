@@ -26,6 +26,14 @@ public:
         float sharpen = 0.0f;
         /// For an output image of an sRGB format, which does the encoding for display itself.
         u32 linear_out = 0;
+        /// The input is read as the bytes it holds, already encoded for display (an sRGB image
+        /// seen through a view of its UNORM sibling, with `gamma` 1): nothing to encode.
+        u32 encoded_in = 0;
+        /// Within `centre_radius` of the middle of the picture (a share of the way to its edge,
+        /// on both axes) it is sharpened by `sharpen_centre` instead: where FSR 1 enlarged the
+        /// scene, which leaves it crisp already (TitleUpscale). 0: no such part.
+        float sharpen_centre = 0.0f;
+        float centre_radius = 0.0f;
     };
 
     void Create(const Instance& instance, MasterSemaphore* master_semaphore,

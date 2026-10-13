@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <filesystem>
+#include <string_view>
+
 #include "common/types.h"
 
 namespace Core::Vr {
@@ -32,7 +35,9 @@ namespace Core::KnownTitle {
 /// to what its frames take. SHADPS4_TITLE_TIMESTEP=0 leaves the title to its own; a number of
 /// frames a second instead of 0 is the slowest rate still made up for (20 unless told).
 /// SHADPS4_TITLE_RESOLUTION=<3..6> holds the title to one size for its scene.
-/// SHADPS4_VR_PACE=<2..6> gives every frame that many refreshes of the display.
+/// SHADPS4_VR_PACE=<2..6> gives every frame that many refreshes of the display;
+/// SHADPS4_VR_STEADY_FPS=<fps> as many as make that many frames a second, throughout.
+/// SHADPS4_VR_LARGEST_SIZE=<3..6>: where the size is chosen here, none larger than that.
 void OnFrameSubmitted();
 
 /// How many refreshes of the display a frame of the title is given at the moment, 0 where
@@ -62,5 +67,33 @@ void Prepare();
 /// and its physics are made to take each step with the time step its bodies were moved for
 /// (SHADPS4_TITLE_PHYSICS_STEP=0 leaves them as the console has them).
 void OnGameLoaded(VAddr base, u64 size);
+
+/// Whether a render area is that of the pictures handed to the headset (the largest size of the
+/// list), where the title is known.
+bool IsEyeSize(u32 width, u32 height);
+
+/// Whether a render pass of that size draws the title's scene for an eye: the size the title
+/// draws that at right now (the coarser shading towards the edges of SHADPS4_VR_FOVEATION is
+/// for those passes). False for every other title.
+bool IsSceneSize(u32 width, u32 height);
+
+/// Whether a size is one of those the title draws its scene at for the headset (whichever it
+/// draws at now), where the title is known.
+bool IsHeadsetSceneSize(u32 width, u32 height);
+
+/// Whether a shader program of the title's (its hash) is the pixel shader of its final pass,
+/// which enlarges the scene to the picture handed to the headset (and sets its tone and levels):
+/// one full-screen draw for each eye's picture, sampling the scene bilinearly (TitleUpscale).
+bool IsSceneEnlargement(u64 pgm_hash);
+
+/// Called with the host file a path of the title's has been found at. A scene parameter file
+/// of the title (known_title_scenes.h) is read from a copy that says what is to be drawn
+/// otherwise than on the console, made from the title's own: by default the sun's shadow maps
+/// of the levels whose sun is black are left out (SHADPS4_TITLE_DARK_SUN_SHADOWS=0 keeps them,
+/// =2 leaves out 3-2's as well); and as asked, less detail (SHADPS4_TITLE_LOD=<share of the
+/// distances at which models change to coarser forms>, SHADPS4_TITLE_SHADOW_MAP=<1024|1536>,
+/// SHADPS4_TITLE_DEPTH_PREPASS=0) or the depth pre-pass's reach (SHADPS4_TITLE_PREPASS_DISTANCE,
+/// _RADIUS). Any other file, and one with nothing to change, is itself.
+std::filesystem::path SceneFile(std::string_view guest_path, std::filesystem::path host_path);
 
 } // namespace Core::KnownTitle

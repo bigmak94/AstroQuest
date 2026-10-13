@@ -142,15 +142,39 @@ env HOME=\$PWD/home XDG_DATA_HOME=\$PWD/home/data XDG_CACHE_HOME=\$PWD/home/cach
 echo exit=\$? >> core.log
 tail -c 2000 core.log
 "
-# How busy the GPU is and how fast it and the processors are clocked, every five seconds: the
-# shell may read that, the app may not. One line per sample in run/gpu.txt:
-#   seconds  busy%  GPU MHz  GPU temperature  MHz of each processor
-"$ADB" shell 'start=$(date +%s); while true; do
+# The run, and a look every five seconds at how busy the GPU is and how fast it and the processors
+# are clocked (the shell may read that, the app may not; one line per sample in run/gpu.txt:
+# seconds, busy%, GPU MHz, GPU temperature, MHz of each processor), go on on the headset by
+# themselves: another program on this PC with an adb of its own can restart the adb server in
+# the middle of a run, which ends whatever is still attached to it. This side only looks in until
+# the run is over.
+cat > build/quest/run/run-instrument.sh <<EOF
+am instrument -w -e cmd '$command' $package/com.astrobotquest.vrhost.SandboxShell > $stage/instrument.txt 2>&1
+touch $stage/run.done
+EOF
+cat > build/quest/run/gpu-sampler.sh <<'EOF'
+start=$(date +%s)
+while [ ! -f /data/local/tmp/astro/run.done ]; do
   echo "$(( $(date +%s) - start )) $(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage | tr -d " %") $(( $(cat /sys/class/kgsl/kgsl-3d0/gpuclk) / 1000000 )) $(( $(cat /sys/class/kgsl/kgsl-3d0/temp) / 1000 )) $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq | while read f; do printf "%s " $(( f / 1000 )); done)"
-  sleep 5; done' > build/quest/run/gpu.txt 2>&1 &
-sampler=$!
-"$ADB" shell "am instrument -w -e cmd '$command' $package/com.astrobotquest.vrhost.SandboxShell" > build/quest/run/instrument.txt 2>&1
-kill $sampler 2>/dev/null
+  sleep 5
+done
+EOF
+(cd build/quest/run && "$ADB" push run-instrument.sh $stage/run-instrument.sh > /dev/null &&
+  "$ADB" push gpu-sampler.sh $stage/gpu-sampler.sh > /dev/null)
+"$ADB" shell "rm -f $stage/run.done $stage/instrument.txt $stage/gpu.txt"
+"$ADB" shell "nohup sh $stage/gpu-sampler.sh > $stage/gpu.txt 2>&1 &"
+"$ADB" shell "nohup sh $stage/run-instrument.sh > /dev/null 2>&1 &"
+waited=0
+until "$ADB" shell "[ -f $stage/run.done ]" > /dev/null 2>&1; do
+  sleep 5
+  waited=$((waited + 5))
+  if (( waited > seconds + 300 )); then
+    echo "the run did not end in time"
+    break
+  fi
+done
+"$ADB" exec-out "cat $stage/instrument.txt" > build/quest/run/instrument.txt 2>/dev/null
+"$ADB" exec-out "cat $stage/gpu.txt" > build/quest/run/gpu.txt 2>/dev/null
 
 rm -rf build/quest/run/screenshots build/quest/run/log build/quest/run/rt_dump
 # A core stuck in a fault loop writes gigabytes; the beginning and the end tell the story.
@@ -160,6 +184,10 @@ if [[ -n "$threads_at" ]]; then
 else
   "$ADB" exec-out "run-as $package sh -c 'head -c 6000000 files/core.log; echo; echo ...; tail -c 400000 files/core.log'"   > build/quest/run/core.log
 fi
+# The GPU profile's tables (SHADPS4_GPU_PROFILE), and the frame rate and the choices of pace and
+# size all along, can sit in the part of a long log left out above.
+"$ADB" exec-out "run-as $package sh -c 'grep -a vk_gpu_profile files/core.log'"   > build/quest/run/profile.txt 2>/dev/null
+"$ADB" exec-out "run-as $package sh -c 'grep -a -e known_title -e \"frame stats\" -e \"frame path\" files/core.log'"   > build/quest/run/pacing.txt 2>/dev/null
 rm -f build/quest/run/*.wav
 "$ADB" exec-out "run-as $package sh -c 'cd files/user && tar -cf - screenshots log rt_dump *.wav 2>/dev/null'" \
   | tar -xf - -C build/quest/run 2>/dev/null

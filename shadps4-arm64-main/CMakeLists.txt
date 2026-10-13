@@ -1018,6 +1018,7 @@ set(CORE src/core/aerolib/stubs.cpp
           src/core/known_title.cpp
           src/core/known_title.h
           src/core/known_title_builds.h
+          src/core/known_title_scenes.h
           src/core/linker.cpp
          src/core/linker.h
          src/core/memory.cpp
@@ -1095,6 +1096,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
                       src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
                       src/shader_recompiler/backend/spirv/spirv_emit_context.h
+                      src/shader_recompiler/backend/spirv/spirv_scene_easu.cpp
                       src/shader_recompiler/frontend/translate/data_share.cpp
                       src/shader_recompiler/frontend/translate/export.cpp
                       src/shader_recompiler/frontend/translate/scalar_alu.cpp
@@ -1221,6 +1223,12 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
+               src/video_core/renderer_vulkan/vk_gpu_profile.cpp
+               src/video_core/renderer_vulkan/vk_gpu_profile.h
+               src/video_core/renderer_vulkan/vk_foveation.cpp
+               src/video_core/renderer_vulkan/vk_foveation.h
+               src/video_core/renderer_vulkan/vk_title_upscale.cpp
+               src/video_core/renderer_vulkan/vk_title_upscale.h
                src/video_core/renderer_vulkan/readconst_snapshot_diag.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h

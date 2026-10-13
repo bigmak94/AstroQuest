@@ -496,6 +496,260 @@ static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readba
     }
 }
 
+// SHADPS4_DBG_EYE_SCAN=<n>: every n-th frame for a headset, both eyes' pictures are read back,
+// and with them the picture handed to the headset's app (both eyes side by side, after the eye
+// copy), and looked over for black blocks in lit surroundings (issue #19: black rectangles on
+// the Quest). A block is told of when it is black in one eye only, or when it was lit at the
+// look before (a few frames earlier). Pictures of such moments go to <UserDir>/eye_scan/ (at most
+// one set every 2 seconds, 80 in all), one set a minute to compare with; each find is logged
+// with the seconds since the first look.
+namespace EyeScan {
+
+constexpr u32 Tile = 4;
+
+struct Tiles {
+    u32 columns{};
+    u32 rows{};
+    std::vector<u8> peak; ///< The brightest channel of any pixel of a 4x4 tile.
+    std::vector<u8> mean; ///< The average over its pixels of each one's brightest channel.
+
+    bool Black(u32 column, u32 row) const {
+        return peak[row * columns + column] <= 6;
+    }
+    /// Inside the middle of the picture, away from the border the view may be shaped with.
+    bool Middle(u32 column, u32 row) const {
+        const float x = (column + 0.5f) / columns * 2.0f - 1.0f;
+        const float y = (row + 0.5f) / rows * 2.0f - 1.0f;
+        return x * x + y * y < 0.85f;
+    }
+};
+
+struct Block {
+    u32 x, y, width, height; ///< In tiles.
+    u32 tiles;
+    float lit_border;
+    bool other_eye_too;
+};
+
+static Tiles Measure(std::span<const u8> rgba, u32 width, u32 height) {
+    Tiles tiles{.columns = width / Tile, .rows = height / Tile};
+    tiles.peak.assign(tiles.columns * tiles.rows, 0);
+    tiles.mean.assign(tiles.columns * tiles.rows, 0);
+    for (u32 row = 0; row < tiles.rows; ++row) {
+        for (u32 column = 0; column < tiles.columns; ++column) {
+            u32 peak = 0;
+            u32 sum = 0;
+            for (u32 y = 0; y < Tile; ++y) {
+                const u8* p = rgba.data() + ((row * Tile + y) * width + column * Tile) * 4;
+                for (u32 x = 0; x < Tile; ++x, p += 4) {
+                    const u32 brightest = std::max({p[0], p[1], p[2]});
+                    peak = std::max(peak, brightest);
+                    sum += brightest;
+                }
+            }
+            tiles.peak[row * tiles.columns + column] = static_cast<u8>(peak);
+            tiles.mean[row * tiles.columns + column] = static_cast<u8>(sum / (Tile * Tile));
+        }
+    }
+    return tiles;
+}
+
+/// Groups of touching black tiles in the middle of the picture that are mostly surrounded by
+/// lit ones: not the night sky or a shadow, something cut out of a lit picture.
+static std::vector<Block> FindBlocks(const Tiles& tiles) {
+    std::vector<Block> blocks;
+    std::vector<u8> seen(tiles.peak.size(), 0);
+    std::vector<u32> stack;
+    for (u32 start = 0; start < tiles.peak.size(); ++start) {
+        const u32 start_column = start % tiles.columns;
+        const u32 start_row = start / tiles.columns;
+        if (seen[start] || !tiles.Black(start_column, start_row) ||
+            !tiles.Middle(start_column, start_row)) {
+            continue;
+        }
+        u32 left = start_column, right = start_column, top = start_row, bottom = start_row;
+        u32 count = 0, border = 0, lit = 0;
+        stack.assign(1, start);
+        seen[start] = 1;
+        while (!stack.empty()) {
+            const u32 at = stack.back();
+            stack.pop_back();
+            const u32 column = at % tiles.columns;
+            const u32 row = at / tiles.columns;
+            ++count;
+            left = std::min(left, column);
+            right = std::max(right, column);
+            top = std::min(top, row);
+            bottom = std::max(bottom, row);
+            const std::array<std::pair<s32, s32>, 4> steps{{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}};
+            for (const auto& [dx, dy] : steps) {
+                const s32 c = static_cast<s32>(column) + dx;
+                const s32 r = static_cast<s32>(row) + dy;
+                if (c < 0 || r < 0 || c >= static_cast<s32>(tiles.columns) ||
+                    r >= static_cast<s32>(tiles.rows)) {
+                    continue;
+                }
+                const u32 next = static_cast<u32>(r) * tiles.columns + static_cast<u32>(c);
+                if (tiles.Black(static_cast<u32>(c), static_cast<u32>(r)) &&
+                    tiles.Middle(static_cast<u32>(c), static_cast<u32>(r))) {
+                    if (!seen[next]) {
+                        seen[next] = 1;
+                        stack.push_back(next);
+                    }
+                } else if (!tiles.Black(static_cast<u32>(c), static_cast<u32>(r))) {
+                    ++border;
+                    lit += tiles.mean[next] >= 8 ? 1 : 0;
+                }
+            }
+        }
+        const float lit_border = border > 0 ? static_cast<float>(lit) / border : 0.0f;
+        if (count >= 4 && count <= 16000 && lit_border >= 0.6f) {
+            blocks.push_back({left, top, right - left + 1, bottom - top + 1, count, lit_border,
+                              false});
+        }
+    }
+    return blocks;
+}
+
+/// Whether the other eye has about as much black in the same rows near the block (the two
+/// pictures differ by the distance between the eyes, so not in the same place).
+static bool OtherEyeToo(const Block& block, const Tiles& other) {
+    constexpr s32 Reach = 80; // tiles to either side: 320 pixels
+    const s32 from = std::max(0, static_cast<s32>(block.x) - Reach);
+    const s32 to = std::min(static_cast<s32>(other.columns) - 1,
+                            static_cast<s32>(block.x + block.width) + Reach);
+    u32 black = 0;
+    for (u32 row = block.y; row < block.y + block.height && row < other.rows; ++row) {
+        for (s32 column = from; column <= to; ++column) {
+            black += other.Black(static_cast<u32>(column), row) ? 1 : 0;
+        }
+    }
+    return black * 2 >= block.tiles;
+}
+
+static std::atomic_bool busy{false};
+
+/// Whether most of a block's tiles were lit at the look before.
+static bool WasLit(const Block& block, const Tiles& tiles, const Tiles& before) {
+    if (before.columns != tiles.columns || before.rows != tiles.rows) {
+        return false;
+    }
+    u32 lit = 0;
+    for (u32 row = block.y; row < block.y + block.height; ++row) {
+        for (u32 column = block.x; column < block.x + block.width; ++column) {
+            if (tiles.Black(column, row)) {
+                lit += before.mean[row * tiles.columns + column] >= 24 ? 1 : 0;
+            }
+        }
+    }
+    return lit * 10 >= block.tiles * 7;
+}
+
+/// One picture's two eyes: the blocks worth telling of, as a log text; how many there were.
+static u32 LookAtPair(std::string_view what, const std::array<Tiles, 2>& tiles,
+                      std::array<Tiles, 2>& before, std::string& found) {
+    u32 told = 0;
+    for (u32 eye = 0; eye < 2; ++eye) {
+        for (auto& block : FindBlocks(tiles[eye])) {
+            block.other_eye_too = OtherEyeToo(block, tiles[eye ^ 1]);
+            const bool appeared = WasLit(block, tiles[eye], before[eye]);
+            if (block.other_eye_too && !appeared) {
+                continue;
+            }
+            ++told;
+            found += fmt::format(
+                " {}, {} eye: {}x{} px at {},{} ({} tiles, border {:.0f}% lit; {}{});", what,
+                eye == 0 ? "left" : "right", block.width * Tile, block.height * Tile,
+                block.x * Tile, block.y * Tile, block.tiles, block.lit_border * 100.0f,
+                block.other_eye_too ? "black in the other eye too" : "this eye only",
+                appeared ? ", lit at the look before" : "");
+        }
+    }
+    before = tiles;
+    return told;
+}
+
+/// `pictures`: the left eye, the right eye and, where there is one, the picture handed to the
+/// headset's app with both eyes side by side.
+static void Look(const std::vector<ScreenshotReadback>& pictures, u32 frame_id) {
+    using Clock = std::chrono::steady_clock;
+    static const auto first = Clock::now();
+    static u32 saved = 0;
+    static auto last_save = Clock::time_point{};
+    static auto last_reference = Clock::time_point{};
+    static u64 scans = 0;
+    static u64 finds = 0;
+    static std::array<Tiles, 2> eyes_before, copy_before;
+    const auto now = Clock::now();
+    std::array<std::vector<u8>, 2> eyes;
+    std::array<Tiles, 2> eye_tiles;
+    for (u32 eye = 0; eye < 2; ++eye) {
+        if (!ConvertReadbackToRgba8(pictures[eye], eyes[eye])) {
+            return;
+        }
+        eye_tiles[eye] = Measure(eyes[eye], pictures[eye].width, pictures[eye].height);
+    }
+    std::vector<u8> copy;
+    std::array<std::vector<u8>, 2> halves;
+    std::array<Tiles, 2> copy_tiles;
+    const bool with_copy = pictures.size() > 2 && ConvertReadbackToRgba8(pictures[2], copy);
+    u32 half_width = 0;
+    if (with_copy) {
+        half_width = pictures[2].width / 2;
+        const u32 height = pictures[2].height;
+        for (u32 eye = 0; eye < 2; ++eye) {
+            halves[eye].resize(size_t{half_width} * height * 4);
+            for (u32 y = 0; y < height; ++y) {
+                std::memcpy(halves[eye].data() + size_t{y} * half_width * 4,
+                            copy.data() + (size_t{y} * pictures[2].width + eye * half_width) * 4,
+                            size_t{half_width} * 4);
+            }
+            copy_tiles[eye] = Measure(halves[eye], half_width, height);
+        }
+    }
+    ++scans;
+    std::string found;
+    u32 told = LookAtPair("the game's picture", eye_tiles, eyes_before, found);
+    if (with_copy) {
+        told += LookAtPair("as handed to the headset", copy_tiles, copy_before, found);
+    }
+    finds += told;
+    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "eye_scan";
+    const auto save = [&](std::string_view kind) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        for (u32 eye = 0; eye < 2; ++eye) {
+            WritePng(dir / fmt::format("{:06}-{}-{}.png", frame_id, kind, eye == 0 ? "L" : "R"),
+                     eyes[eye], pictures[eye].width, pictures[eye].height);
+        }
+        if (with_copy) {
+            WritePng(dir / fmt::format("{:06}-{}-headset.png", frame_id, kind), copy,
+                     pictures[2].width, pictures[2].height);
+        }
+    };
+    const double seconds = std::chrono::duration<double>(now - first).count();
+    if (told > 0) {
+        LOG_INFO(Render_Vulkan, "Eye scan at {:.1f} s, frame {}:{}", seconds, frame_id, found);
+        if (saved < 80 && now - last_save >= std::chrono::seconds{2}) {
+            ++saved;
+            last_save = now;
+            save("found");
+        }
+    } else if (now - last_reference >= std::chrono::seconds{60}) {
+        last_reference = now;
+        save("plain");
+    }
+    if (scans % 300 == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Eye scan at {:.1f} s: {} frames looked at{}, {} blocks told of ({} sets of "
+                 "pictures kept)",
+                 seconds, scans, with_copy ? " (with the picture handed to the headset)" : "",
+                 finds, saved);
+    }
+}
+
+} // namespace EyeScan
+
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
@@ -876,6 +1130,52 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
         }
     }
 
+    // SHADPS4_DBG_TRACE_HMD_FRAMES=<frame>,<frame>...: after each of those frames, the draws of
+    // the next ones are traced (2500 entries).
+    {
+        static const std::vector<u32> trace_frames = [] {
+            std::vector<u32> frames;
+            if (const char* value = std::getenv("SHADPS4_DBG_TRACE_HMD_FRAMES")) {
+                for (const char* at = value; *at != '\0';) {
+                    char* end = nullptr;
+                    frames.push_back(static_cast<u32>(std::strtoul(at, &end, 10)));
+                    if (end == at) {
+                        break;
+                    }
+                    at = *end == ',' ? end + 1 : end;
+                }
+            }
+            return frames;
+        }();
+        // SHADPS4_DBG_DUMP_HMD_FRAMES=<frame>,...: what the guest has rendered when that frame is
+        // handed over, to <UserDir>/rt_dump-<frame>.
+        static const std::vector<u32> dump_frames = [] {
+            std::vector<u32> frames;
+            if (const char* value = std::getenv("SHADPS4_DBG_DUMP_HMD_FRAMES")) {
+                for (const char* at = value; *at != '\0';) {
+                    char* end = nullptr;
+                    frames.push_back(static_cast<u32>(std::strtoul(at, &end, 10)));
+                    if (end == at) {
+                        break;
+                    }
+                    at = *end == ',' ? end + 1 : end;
+                }
+            }
+            return frames;
+        }();
+        if (std::ranges::find(dump_frames, frame_id) != dump_frames.end()) {
+            DumpGpuImages(fmt::format("rt_dump-{}", frame_id));
+        }
+        static u32 marked = 0;
+        if (std::ranges::find(trace_frames, frame_id) != trace_frames.end()) {
+            Rasterizer::StartDrawTrace(2500);
+            marked = 12;
+        }
+        if (marked > 0 || Rasterizer::DrawTraceActive()) {
+            marked -= marked > 0 ? 1 : 0;
+            LOG_INFO(Render_Vulkan, "TRACE HMD frame {} handed over", frame_id);
+        }
+    }
     static u32 logged_frames = 0;
     if (logged_frames < 3 || (logged_frames % 600) == 0) {
         for (u32 eye = 0; eye < 2; ++eye) {
@@ -950,16 +1250,72 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
         .pImageMemoryBarriers = pre_barriers.data(),
     });
 
+    // Pictures the title keeps sRGB-encoded are read as the bytes they hold where what is made
+    // of them is encoded the same way (gamma 1) and they are copied pixel for pixel: the
+    // hardware then does not decode every tap the sharpening takes, only for the shader to
+    // encode it again. (Where a picture is drawn larger or smaller, as into a window, its
+    // pixels are blended, and blended encoded they would come out darker in fine detail.) Both
+    // eyes or neither: they share the pass's settings. (Not where an image was made without
+    // that view's format, to be moved to one that allows it; nor under the A/B measuring aid
+    // as "ppcopy".)
+    const auto encoded_sibling = [](vk::Format format) {
+        switch (format) {
+        case vk::Format::eR8G8B8A8Srgb:
+            return vk::Format::eR8G8B8A8Unorm;
+        case vk::Format::eB8G8R8A8Srgb:
+            return vk::Format::eB8G8R8A8Unorm;
+        default:
+            return vk::Format::eUndefined;
+        }
+    };
+    const auto pixel_for_pixel = [&](const Frame* target) {
+        return target == nullptr ||
+               (target->width == eye_width * 2 && target->height == eye_height);
+    };
+    const auto& right_info = texture_cache.GetImage(image_ids[1]).info;
+    bool encoded_in = pp_settings.gamma == 1.0f && pp_settings.hdr == 0 && !spectator &&
+                      pixel_for_pixel(frame) && pixel_for_pixel(local) &&
+                      right_info.size.width == eye_width && right_info.size.height == eye_height &&
+                      !FrameStats::AbOff("ppcopy");
+    for (u32 eye = 0; eye < 2 && encoded_in; ++eye) {
+        const vk::Format sibling = encoded_sibling(descs[eye].view_info.format);
+        encoded_in = sibling != vk::Format::eUndefined &&
+                     texture_cache.GetImage(image_ids[eye]).backing->image.AllowsViewFormat(
+                         sibling);
+    }
+    static const u32 eye_scan_every = [] {
+        const char* value = std::getenv("SHADPS4_DBG_EYE_SCAN");
+        return value != nullptr ? static_cast<u32>(std::max(0, std::atoi(value))) : 0u;
+    }();
+    std::shared_ptr<std::vector<ScreenshotReadback>> eye_scan;
+    if (eye_scan_every > 0 && frame_id % eye_scan_every == 0 && !EyeScan::busy.exchange(true)) {
+        eye_scan = std::make_shared<std::vector<ScreenshotReadback>>();
+        eye_scan->reserve(2);
+    }
     std::array<vk::ImageView, 2> eye_views;
     for (u32 eye = 0; eye < 2; ++eye) {
         auto view_info = descs[eye].view_info;
         // Exclude alpha from output frame to avoid blending with UI.
         view_info.mapping.a = vk::ComponentSwizzle::eOne;
+        if (encoded_in) {
+            view_info.format = encoded_sibling(view_info.format);
+        }
 
+        // The view first: an image that does not allow the view's format moves to a backing
+        // that does, and that is the one to get ready for reading.
         auto& image = texture_cache.GetImage(image_ids[eye]);
+        eye_views[eye] = *image.FindView(view_info).image_view;
+        if (eye_scan) {
+            image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+                          {}, cmdbuf);
+            eye_scan->emplace_back(instance, draw_scheduler, ScreenshotKind::GameOnly,
+                                   std::vector<std::filesystem::path>{}, image.info.size.width,
+                                   image.info.size.height, image.info.pixel_format, false);
+            CopyImageToReadback(cmdbuf, image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                                eye_scan->back());
+        }
         image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
                       {}, cmdbuf);
-        eye_views[eye] = *image.FindView(view_info).image_view;
     }
     // Left eye on the left half, right eye on the right half.
     const auto regions_for = [&](const Frame& target) {
@@ -986,6 +1342,19 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
     }();
     auto hmd_settings = pp_settings;
     hmd_settings.sharpen = sharpen;
+    hmd_settings.encoded_in = encoded_in ? 1 : 0;
+    // Where FSR 1 enlarged the title's scene (TitleUpscale), the picture is crisp already:
+    // sharpened by SHADPS4_VR_SHARPEN_FSR there (half of the rest by default).
+    if (rasterizer->EyesUpscaled()) {
+        static const float sharpen_fsr = [] {
+            const char* value = std::getenv("SHADPS4_VR_SHARPEN_FSR");
+            return value != nullptr
+                       ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f)
+                       : -1.0f;
+        }();
+        hmd_settings.sharpen_centre = sharpen_fsr >= 0.0f ? sharpen_fsr : sharpen * 0.5f;
+        hmd_settings.centre_radius = rasterizer->UpscaledRadius();
+    }
     if (frame != nullptr) {
         const auto bounds = Core::Vr::SpectatorContentRect(frame->width, frame->height,
                                                         desktop_aspect, crop);
@@ -1023,6 +1392,45 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
             pp_pass.Render(cmdbuf, regions_for(*frame), *frame, hmd_settings,
                            exported ? std::nullopt : std::optional<u32>{frame_id});
         }
+        if (exported && eye_scan) {
+            // What the headset's app gets, as the eye copy left it (in the general layout).
+            const auto copy_barrier = [&](vk::PipelineStageFlags2 src_stage,
+                                          vk::AccessFlags2 src_access,
+                                          vk::PipelineStageFlags2 dst_stage,
+                                          vk::AccessFlags2 dst_access) {
+                const vk::ImageMemoryBarrier2 barrier = {
+                    .srcStageMask = src_stage,
+                    .srcAccessMask = src_access,
+                    .dstStageMask = dst_stage,
+                    .dstAccessMask = dst_access,
+                    .oldLayout = vk::ImageLayout::eGeneral,
+                    .newLayout = vk::ImageLayout::eGeneral,
+                    .image = frame->image,
+                    .subresourceRange{
+                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+                        .levelCount = 1,
+                        .layerCount = 1,
+                    },
+                };
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .imageMemoryBarrierCount = 1,
+                    .pImageMemoryBarriers = &barrier,
+                });
+            };
+            copy_barrier(vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                             vk::PipelineStageFlagBits2::eFragmentShader,
+                         vk::AccessFlagBits2::eColorAttachmentWrite,
+                         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+            eye_scan->emplace_back(instance, draw_scheduler, ScreenshotKind::GameOnly,
+                                   std::vector<std::filesystem::path>{}, frame->width,
+                                   frame->height, swapchain.GetSurfaceFormat().format, false);
+            CopyImageToReadback(cmdbuf, frame->image, vk::ImageLayout::eGeneral, eye_scan->back());
+            copy_barrier(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+                         vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                             vk::PipelineStageFlagBits2::eTransfer,
+                         vk::AccessFlagBits2::eColorAttachmentWrite |
+                             vk::AccessFlagBits2::eTransferRead);
+        }
         if (exported) {
             vr_exporter->Finalize(frame, cmdbuf);
         }
@@ -1036,6 +1444,12 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
         DebugState.output_resolution = {local->width, local->height};
     }
     DebugState.game_resolution = {eye_width * 2, eye_height};
+    if (eye_scan) {
+        draw_scheduler.DeferPriorityOperation([eye_scan, frame_id]() {
+            EyeScan::Look(*eye_scan, frame_id);
+            EyeScan::busy = false;
+        });
+    }
 
     // Flush frame creation commands.
     for (Frame* target : {frame, local}) {
@@ -1068,7 +1482,7 @@ bool Presenter::DeliverHmdFrame(Frame* frame, const Core::Vr::PresentedFrame& in
     return true;
 }
 
-void Presenter::DumpGpuImages() {
+void Presenter::DumpGpuImages(std::string_view folder) {
     // SHADPS4_DUMP_WIDTH=<pixels>: how wide the pictures are at most (640 unless told; the
     // targets' own width for looking at what is in a pixel).
     static const u32 ThumbWidth = [] {
@@ -1076,7 +1490,7 @@ void Presenter::DumpGpuImages() {
         const int width = value != nullptr ? std::atoi(value) : 0;
         return width >= 64 ? static_cast<u32>(width) : 640u;
     }();
-    const auto dump_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "rt_dump";
+    const auto dump_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / folder;
     std::error_code ec;
     std::filesystem::remove_all(dump_dir, ec);
     std::filesystem::create_directories(dump_dir, ec);

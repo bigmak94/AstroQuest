@@ -353,8 +353,22 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
-    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+    // Where a render pass has a map of how coarsely to shade (Foveation), the rate it gives
+    // replaces the pipeline's own, which is every pixel; without a map it is every pixel too.
+    // Any pipeline may be used in such a pass, so all are made for it.
+    const bool foveated = instance.IsFoveationSupported();
+    const vk::PipelineFragmentShadingRateStateCreateInfoKHR shading_rate = {
         .pNext = &pipeline_rendering_ci,
+        .fragmentSize = {1, 1},
+        .combinerOps = std::array{vk::FragmentShadingRateCombinerOpKHR::eKeep,
+                                  vk::FragmentShadingRateCombinerOpKHR::eReplace},
+    };
+
+    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+        .pNext = foveated ? static_cast<const void*>(&shading_rate)
+                          : static_cast<const void*>(&pipeline_rendering_ci),
+        .flags = foveated ? vk::PipelineCreateFlagBits::eRenderingFragmentShadingRateAttachmentKHR
+                          : vk::PipelineCreateFlags{},
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,

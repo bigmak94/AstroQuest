@@ -191,7 +191,8 @@ bool VrExporter::Import(Slot& slot, const Core::Vr::HostBuffers& offer, vk::Form
             .arrayLayers = 1,
             .samples = vk::SampleCountFlagBits::e1,
             .tiling = vk::ImageTiling::eLinear,
-            .usage = vk::ImageUsageFlagBits::eColorAttachment,
+            .usage = vk::ImageUsageFlagBits::eColorAttachment |
+                     vk::ImageUsageFlagBits::eTransferSrc,
             .initialLayout = vk::ImageLayout::eUndefined,
         },
         vk::ExternalMemoryImageCreateInfo{
@@ -371,12 +372,15 @@ void VrExporter::Finalize(Frame* frame, vk::CommandBuffer cmdbuf) {
         return;
     }
 
+    // The post-processing pass leaves the frame in the general layout, after a barrier of its
+    // own that waits for its colour writes.
     const vk::ImageMemoryBarrier2 barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                        vk::PipelineStageFlagBits2::eFragmentShader,
         .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .oldLayout = vk::ImageLayout::eGeneral,
         .newLayout = vk::ImageLayout::eTransferSrcOptimal,
         .image = frame->image,
         .subresourceRange{

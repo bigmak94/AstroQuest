@@ -6,7 +6,10 @@
 #include <ranges>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "core/known_title.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_foveation.h"
+#include "video_core/renderer_vulkan/vk_gpu_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -381,16 +384,24 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
         SetBackingSamples(info.num_samples);
     }
+    // (The format was seen to for it then: a backing that cannot have it is left for another.)
+    if (backing->last_view_id && backing->last_view_info == view_info &&
+        !Vulkan::FrameStats::AbOff("textures")) {
+        return (*slot_image_views)[backing->last_view_id];
+    }
     EnsureViewFormat(ImageView::HostFormat(*instance, view_info, *this));
     const auto& view_infos = backing->image_view_infos;
     const auto it = std::ranges::find(view_infos, view_info);
+    ImageViewId view_id;
     if (it != view_infos.end()) {
-        const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
-        return (*slot_image_views)[view_id];
+        view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
+    } else {
+        view_id = slot_image_views->insert(*instance, view_info, *this);
+        backing->image_view_infos.emplace_back(view_info);
+        backing->image_view_ids.emplace_back(view_id);
     }
-    const auto view_id = slot_image_views->insert(*instance, view_info, *this);
-    backing->image_view_infos.emplace_back(view_info);
-    backing->image_view_ids.emplace_back(view_id);
+    backing->last_view_info = view_info;
+    backing->last_view_id = view_id;
     return (*slot_image_views)[view_id];
 }
 
@@ -553,6 +564,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
         scheduler->EndRendering();
         cmdbuf = scheduler->CommandBuffer();
     }
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::Barrier);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
@@ -705,6 +717,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
 }
 
 void Image::CopyImage(Image& src_image) {
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::ImageCopy);
     const auto& src_info = src_image.info;
 
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
@@ -806,6 +819,7 @@ void Image::CopyImage(Image& src_image) {
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
 }
 void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset) {
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::ImageCopy);
     const auto& src_info = src_image.info;
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
     const u32 num_layers = std::min(src_info.resources.layers, info.resources.layers);
@@ -886,6 +900,7 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
 }
 
 void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::ImageCopy);
     const auto& src_info = src_image.info;
 
     const auto src_block_dim = src_info.BlockDim();
@@ -929,13 +944,16 @@ void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
 
 void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_range,
                     const VideoCore::SubresourceRange& mrt1_range) {
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::ImageCopy);
     SetBackingSamples(1, false);
     scheduler->EndRendering();
 
     // Where the host holds what the guest multisamples with one sample a pixel, there is
     // nothing to resolve, and a copy would leave every edge as jagged as it was drawn: the
-    // picture gets its edges smoothed on the way instead.
-    if (blit_helper->SmoothsResolves() && src_image.info.num_samples > 1 &&
+    // picture gets its edges smoothed on the way instead. (Under the A/B measuring aid as
+    // "resolveaa", copied as it is.)
+    if (blit_helper->SmoothsResolves() && !Vulkan::FrameStats::AbOff("resolveaa") &&
+        src_image.info.num_samples > 1 &&
         src_image.backing->image.image_ci.samples == vk::SampleCountFlagBits::e1 &&
         src_image.info.size == info.size && !info.props.is_depth &&
         instance->IsFormatSupported(src_image.info.pixel_format,
@@ -946,9 +964,17 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
                           vk::AccessFlagBits2::eShaderRead, mrt0_range);
         Transit(vk::ImageLayout::eColorAttachmentOptimal,
                 vk::AccessFlagBits2::eColorAttachmentWrite, mrt1_range);
+        // With foveated rendering an eye's scene is shaded in blocks of pixels towards its
+        // edges: smoothing its edges there is time the GPU does not have (a twentieth of a
+        // frame's in the first level). (Under the A/B measuring aid as "fxaafine", smoothed
+        // all over.)
+        const bool fine_only = Vulkan::Foveation::Level() > 0 &&
+                               instance->IsFoveationSupported() &&
+                               Core::KnownTitle::IsSceneSize(info.size.width, info.size.height) &&
+                               !Vulkan::FrameStats::AbOff("fxaafine");
         blit_helper->SmoothInto(info.size.width, info.size.height, src_image.info.pixel_format,
                                 info.pixel_format, src_image.GetImage(), mrt0_range.base.layer,
-                                GetImage(), mrt1_range.base.layer);
+                                GetImage(), mrt1_range.base.layer, fine_only);
         flags |= VideoCore::ImageFlagBits::GpuModified;
         flags &= ~VideoCore::ImageFlagBits::Dirty;
         return;
@@ -1009,6 +1035,7 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
 }
 
 void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range) {
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::Clear);
     const vk::ImageSubresourceRange vk_range = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = range.base.level,

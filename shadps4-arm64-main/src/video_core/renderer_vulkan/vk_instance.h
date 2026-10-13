@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include <span>
 #include <unordered_map>
 
@@ -122,6 +124,24 @@ public:
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
+    }
+
+    /// True where foveation was asked for (Foveation::Level) and the GPU can shade render
+    /// passes as coarsely as a map of rates says (VK_KHR_fragment_shading_rate).
+    bool IsFoveationSupported() const {
+        return foveation;
+    }
+
+    /// The pixels a texel of a shading rate map covers on each side.
+    u32 FoveationTexel() const {
+        return foveation_texel;
+    }
+
+    /// Whether blocks of that many pixels can be shaded as one (with one sample a pixel).
+    bool IsFoveationRateSupported(u32 width, u32 height) const {
+        return std::ranges::any_of(foveation_rates, [&](const vk::Extent2D& rate) {
+            return rate.width == width && rate.height == height;
+        });
     }
 
     /// Returns true when VK_EXT_custom_border_color is supported
@@ -561,6 +581,9 @@ private:
     bool workgroup_memory_explicit_layout{};
     bool maintenance_8{};
     bool attachment_feedback_loop{};
+    bool foveation{};
+    u32 foveation_texel{};
+    std::vector<vk::Extent2D> foveation_rates;
     bool image_2d_view_of_3d{};
     bool supports_memory_budget{};
     bool external_memory_dma_buf{};

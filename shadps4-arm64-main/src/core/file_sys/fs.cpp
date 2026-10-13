@@ -6,6 +6,7 @@
 #include "core/file_sys/devices/logger.h"
 #include "core/file_sys/devices/nop_device.h"
 #include "core/file_sys/fs.h"
+#include "core/known_title.h"
 
 namespace Core::FileSys {
 
@@ -43,6 +44,15 @@ void MntPoints::UnmountAll() {
 
 std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_read_only,
                                              HostPathType path_type) {
+    std::filesystem::path host_path = FindHostPath(path, is_read_only, path_type);
+    if (path_type == HostPathType::Default) {
+        return KnownTitle::SceneFile(path, std::move(host_path));
+    }
+    return host_path;
+}
+
+std::filesystem::path MntPoints::FindHostPath(std::string_view path, bool* is_read_only,
+                                              HostPathType path_type) {
     // Evil games like Turok2 pass double slashes e.g /app0//game.kpf
     std::string corrected_path(path);
     size_t pos = corrected_path.find("//");

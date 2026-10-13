@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
@@ -29,6 +31,13 @@ enum class BufferType : u32 {
 
 struct Info;
 
+/// Read-only guest buffers no larger than this many bytes are uniform buffers in the shaders
+/// instead of storage buffers; 0 makes every buffer a storage buffer. The renderer sets it
+/// before each draw, so that a draw's shaders, pipeline layout and descriptors agree.
+/// (Adreno's driver can serve what shaders read from uniform buffers from its constant
+/// registers or constant cache; every read of a storage buffer goes to memory.)
+inline std::atomic<u32> uniform_buffer_limit{0};
+
 struct BufferResource {
     u32 sharp_idx;
     IR::Type used_types;
@@ -49,9 +58,15 @@ struct BufferResource {
         // the maximum possible size always. However, for some vendors the shader-supplied size is
         // used for bounds checking uniform buffer accesses, so the latter would effectively turn
         // off buffer robustness behavior. Instead, force storage buffers which are bounds checked
-        // using the actual buffer size. We are assuming the performance hit from this is
-        // acceptable.
-        return true; // buffer.GetSize() > profile.max_ubo_size || is_written;
+        // using the actual buffer size, unless the renderer asks for uniform buffers where they
+        // may be (uniform_buffer_limit).
+        // (Only by what a slot is, never by where its buffer lies or how long it is to the byte:
+        // a slot whose kind changed from draw to draw would make another permutation of the
+        // shader each time. Where a uniform buffer lies and how it ends is the business of
+        // BufferCache::ObtainUniformBuffer.)
+        const u32 limit = uniform_buffer_limit.load(std::memory_order_relaxed);
+        return limit == 0 || is_written || buffer_type != BufferType::Guest ||
+               buffer.GetSize() > limit;
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {

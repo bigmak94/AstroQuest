@@ -165,6 +165,203 @@ PC.
 Both were found and tried on the PC, in the headset through Virtual Desktop. The Quest app
 has the same emulator code; it had not been run on a headset when this went out.
 
+**App 0.21 (2026-10-13): "Detail further away" in the start-up menu.** The menu has a second line
+(Up / Down choose the line, Left / Right change it): *Lighter: faster*, the default, has the
+game's models change to their simpler forms at a third of the distances the game has for that;
+*As on the console* leaves them as they are. In level 3-2 the lighter setting halves the
+vertices the GPU draws (3.7 instead of 7.4 million a frame) and takes a sixth off the GPU's
+time for a frame; side by side the pictures are hard to tell apart. It also has the sun's
+shadows drawn into maps of 1024x1024 instead of 2048x2048 (softer shadow edges). The choice is remembered,
+`detail=` in `vrhost.txt` sets it. See "What a frame costs the headset's GPU" under "Speed".
+A third line, *Foveated rendering* (Off / Low / Medium / High / Very High, Medium the
+default), has the edges of the picture shaded in blocks of 2x2 pixels where the lenses show
+less; with both at their defaults a frame of 3-2 takes 14.3 instead of 20.1 ms of the GPU. A
+fourth line, *Display refresh rate*, has 90 Hz (the default) or 120 Hz; the display switches as
+soon as it is changed. (The game runs at 30 frames a second at either: every frame is shown
+three times at 90 Hz, four times at 120, where the compositor's work leaves the game a little
+less of the GPU.)
+
+Also in 0.21: the frame rate changes less often (a faster pace is only tried after
+five seconds in which everything a frame takes fits it with a quarter to spare, and a failed
+try makes the next wait longer; see "The size of the picture" under "Speed"), and the thread
+that hands the game's drawing to the GPU takes a fifth less time a frame in 3-2 and a quarter
+less in the world select (see "What the GPU thread does for a draw").
+
+**Also in 0.21: more of the GPU left for the picture's size** (the night of 2026-10-09).
+The first worn session with the above played the first level at a steady 30 frames a second,
+but at 816x870 an eye throughout, the smallest size, with the GPU busy 76 to 82% of the time in
+the level's ordinary views and 95 to 99% in its heaviest (where frames fell to 25 a second).
+Measured since in that level, in the same views and with the same settings, the headset not
+worn (`SHADPS4_DBG_AB`, the two ways taking turns in one run; sandbox GPU times at 690 MHz):
+
+- **the game's constants as uniform buffers.** What a draw reads and does not write, up to 16
+  KB (the constants of its shaders, mostly), reaches the shaders as uniform buffers instead of
+  storage buffers. Adreno's driver loads uniform buffers into the shader's constant registers
+  before the draw's work starts; storage buffers it reads from memory over and over, and the
+  work waits for that. A frame of the first level takes 14% less of the GPU (15.8 instead of
+  18.4 ms), one of 3-2 13% less, and the thread that hands the drawing over 5% less. On by
+  default with the headset's driver; `SHADPS4_UBO=0` turns it off, `=1` on with other drivers.
+- **the size chosen by what a size really costs.** 960x1080 costs the GPU only 10% more than
+  816x870 in the first level (21% in 3-2); the emulator counted it at 35% more and wanted a
+  quarter of a frame's time to spare before it went up, so the first level stayed at 816x870.
+  It now starts from 21%, wants an eighth to spare, and learns from every change of size it
+  makes what the step really costs. 30 frames a second at 960x1080 come before 40 at 816x870.
+  See "The size of the picture" under "Speed".
+- **90 Hz by default.** At 30 frames a second the headset's compositor makes three pictures of
+  each frame at 90 Hz, four at 120: one less at about 1 ms of the GPU each (less for the game
+  than the 4 ms 120 Hz takes from every frame of 30). 120 Hz stays a choice in the start-up
+  menu (at 30 frames a second as well since the morning of 2026-10-09).
+- **the sun's shadow maps at 1024x1024** with *Lighter* detail: a frame of the first level
+  takes 4% less (14.6 instead of 15.2 ms); shadows' edges are a little softer. (Leaving the
+  shadow maps' 18 filtering taps out altogether would only save 3%, and the depth pre-pass
+  limited to 10 m and models simplified at a fifth of the game's distances instead of a third
+  changed next to nothing: none of those were kept.)
+- **edges smoothed only in the middle of the picture** where foveated rendering is on: the
+  smoothing of the scene's edges (FXAA, four times a frame) stops where the picture is shaded
+  in blocks anyway; 0.45 ms (3%) less a frame of the first level.
+- **the eyes' copy into the picture handed over.** That picture (2880x1536) was cleared before
+  the two eyes were drawn over all of it, 17.7 MB written for nothing every frame; it no
+  longer is. And the eyes are read as the bytes they hold (sRGB images seen through views of
+  the plain format): the sharpening no longer decodes every pixel it reads only to encode it
+  again. Together 1.2 ms (5%) less of the GPU a frame, measured in the self-test, where the
+  host's copy and a compositor stand-in run as in a session. The app's own copy into the
+  compositor's image tells the driver that the image's old contents are not needed, and is
+  timed on the GPU: `host.log`'s pacing lines say what it took.
+- draws that write nothing (the game's tests of what is in view; about a hundred a frame in
+  the first level) are left out: 1.6% less GPU time in 3-2.
+- in the levels whose sun is black (FOREST CASTLE, INDY CAVE 2, the graveyard, the spider
+  boss, and two challenges whose sun is at most a hundredth of a lit one's) its shadow maps
+  are left out: a shadow pass of a tenth of a frame that shaded nothing (the game's own files
+  for the inside of the whale do the same). Not where a level shares its file with one that
+  has a sun (CANNON MANIA and CAVE & CANNONS, the whale's levels, LAVA RUN).
+
+All together, in the first level's ordinary view at 816x870 (the headset not worn, GPU at
+690 MHz): 18.3 ms of the GPU a frame before, 14.7 now (a fifth less), and 960x1080 costs 16.2;
+in a session the eyes' copy and one picture of the compositor fewer a frame come on top
+(about 2 ms). In the level bench (the self-test with a compositor stand-in at 90 Hz, the
+level's heaviest view), the emulator now holds 30 frames a second at 1200x1280 with the GPU
+busy 79% of the time; at a session's slower GPU clock that is 960x1080 to 1200x1280. What a
+worn session makes of it is still to be seen.
+
+Looked into and left: the game's anisotropic filtering (it asks for 2x and 4x only); pushing
+a draw's descriptors only where they change (0.6 ms in a frame cut down to one triangle a
+draw, and it would undo what the uniform buffers gain); drawing both eyes at once, see
+"Drawing both eyes at once" under "Speed".
+
+**Also in 0.21: 30 frames a second throughout, and only the picture's size changes** (after
+the session of the morning of 2026-10-09, which played the world select, the first level and
+3-2 with the build above). Frames dropped in the menus before the first level, and 3-2 slowed
+down in its middle. The session's log shows why:
+
+- the emulator changed the picture's size 43 times in nine and a half minutes (816x870 to
+  1440x1536 and back). 15 of its 23 steps up were taken back within half a minute, and every
+  one of its eleven trips above 960x1080 ended with frames of 35 to 45 ms: those are the
+  slowdowns of 3-2 (816x870 held the game at full speed there);
+- it tried 45 frames a second for 104 seconds in all, at the edge of what fitted, and in the
+  menus at 1440x1536, which the scene behind them could not keep up with once it turned heavy;
+- the menus' first scenes loaded while every shader they use was compiled anew: the first
+  session after a new build compiles each of them once.
+
+A replay of that log through a model of the emulator's rules (every set of rules run 40 times,
+with the GPU's work changing from moment to moment as it did in the session) chose the rules now
+in place:
+
+- **always 30 frames a second**: frames are given three refreshes at 90 Hz and four at 120, in
+  the menus and in the levels alike; only the picture's size follows what the GPU has time
+  for. `pace=` in `vrhost.txt` still sets a number of refreshes instead.
+- **1200x1280 at most** (`largest_resolution=` sets another): the larger sizes fitted the GPU's
+  time only in lighter moments, and were taken back seconds later. (First 960x1080; the session
+  of midday 2026-10-09 played the first level at that size with the GPU busy only 55 to 65% of
+  the time, room the cap left unused: 1200x1280 since.)
+- **a larger size only after four seconds in a row** in which it would have fitted with a fifth
+  of a frame's time to spare (a frame that came late starts the count again), and not within
+  ten seconds of any change. One half-second that fitted was enough before, and the views of
+  these levels change by 12 to 20% within seconds. What a step was seen to cost goes to the
+  log only: counted, it had drifted to steps that looked almost free, which made steps up
+  eager.
+
+In the replay those rules change the size about five times in the session's nine and a half
+minutes instead of 43, and hardly ever take a step back. In the level bench (the first level's
+heaviest view, with a stand-in for the compositor at 90 Hz) the size did not change once in 320
+seconds: 960x1080 at 30 frames a second throughout. What these rules leave of the slowdowns:
+the moments the processor needs longer than a frame for the heaviest views (the thread that
+hands the game's drawing to the GPU takes 20 ms and more a frame there), and the shaders of a
+new build compiled in its first session. The GPU's driver keeps what it compiled in the app's
+cache: in the sandbox, the menus and the first level played with that cache emptied had 16
+seconds below 27 frames a second and one stop of 1.4 seconds; played again with it filled, 8
+such seconds (the game's own loading, the same in both runs) and no stop.
+
+Also in 0.21:
+
+- **Foveated rendering: Very High**, a fifth choice in the start-up menu: nine tenths of the
+  picture in blocks of 2x2 pixels, its outer three fifths in 4x4. It takes the GPU 5.5% less
+  than High in 3-2 and 3% less in the first level, see "Foveated rendering" under "Speed"; the
+  outer part of the picture is visibly coarse.
+- **the start-up menu stands still in the room** instead of following the head: 1.5 m in front
+  of where the head faced when it appeared, a hand's breadth below the eyes. The headset's own
+  reset of the view brings it back in front, and so does putting the headset back on. (The
+  card on the controls that OPTIONS brings up, and the notice of a game that stopped
+  drawing, still follow the head: they are to be read wherever the player looks.)
+- the log says how long the driver took over every new pipeline ("Graphics pipeline ... made
+  in ... ms").
+- **black squares at the end of the first level**: not seen here, and not explained yet. Ruled
+  out: a change of the picture's size in the last stretch of the level (there was none until
+  the level ended); a NaN let through by max, min or clamp (the headset's GPU drops NaN in those
+  as the PlayStation 4's does: tested on the device); sizes changing every two seconds in the
+  first level and in the world select (no squares in the pictures taken). The GPU of the
+  PlayStation 4 has legacy multiply-adds where zero times anything is zero; the emulator now
+  does them that way too, although no shader of the menus or of the first level uses them. The
+  level's own teardown after its goal (many pictures made and dropped at once, as at the end
+  of 3-2) is what the log has at about that time.
+
+**Also in 0.21: FSR 1 for the game's enlargement of its picture, on by default** (after the
+session of midday 2026-10-09: "the resolution is still very low; could some kind of DLSS
+upscale the picture?", then "make FSR 1 nearly free"). DLSS itself needs an NVIDIA GPU, and the
+upscalers that work over time (DLSS, FSR 2, Snapdragon GSR 2) need motion vectors for every
+pixel, which this game never draws. What fits is a spatial one: the game draws its scene at
+816x870 to 1440x1536 an eye and enlarges it to 1440x1536 itself, bilinearly, in its final pass
+(the one that also sets its tone and levels). With *FSR 1* on the fifth line of the start-up
+menu, *Picture enlarged with* (the default), that pass reads its scene with AMD's FSR 1 edge
+adaptive filter (EASU) instead: the emulator compiles the game's own final pixel shader with
+the filter written into it in place of its one bilinear read (`TitleUpscale`,
+`spirv_scene_easu.cpp`), so the rest of the pass is the game's and no picture is made on the
+way. Only in the middle of the view, where it is shaded finely (beyond it EASU makes the blocks
+of the coarse shading stand out), and wherever the scene is enlarged at all (816x870, 960x1080
+and 1200x1280); the eye copy sharpens that part half as much. The same pass also makes the
+picture for the TV, from a 640x360 scene, which nothing shows while the headset is in use: that
+one is left as the game makes it (since 2026-10-11). The filter's arithmetic is done
+in 16 bits, as in FSR 1's own version for that, and where the four texels nearest a pixel are
+all but the same, the game's bilinear read stays (the filter could only return something
+between them too). On the PC, the first level at 960x1080: edges, leaves and outlines crisper;
+no detail is added.
+
+What it takes the headset's GPU (the first level, 30 frames a second, the two ways taking turns
+in one run): **about 0.65 ms a frame**, at 960x1080 and at 1200x1280 alike, where the first
+version (the filter made a picture of its own, which the game's pass then read) took 3.6 ms.
+That first version cost as much as the next larger scene size, so with it on the scene was
+drawn smaller more often (the session of 2026-10-09 18:19 stayed at 816x870); now the next size
+costs four times what FSR does (1200x1280 takes 2.7 ms more than 960x1080 there). Of the 0.65
+ms, 0.2 is the filter's code sitting in the shader (it looks at every pixel whether to filter
+there), the rest the filter itself. (The measuring runs never had the TV's picture made; in the
+session of 2026-10-11 16:36 it was, and the filter on it would have added about 0.1 ms by its
+size.) `fsr=0` in `vrhost.txt` has the game enlarge its picture
+itself, as the menu's *The game's own* does.
+
+**Also in 0.21: no more black squares in the right eye** (issue #19; the user, 2026-10-13:
+"blocks of pixel just appears black for a couple of seconds then switch back to normal", right
+after *Continue* and in levels). The game draws both eyes into the same depth buffer, the second
+right after the first; the emulator cleared it for the right eye without a barrier after the left
+eye's pass, as the buffer stayed in its layout. The headset's GPU driver, drawing straight to
+memory, then let what the left eye's pass still had in its cache land on the cleared buffer
+later, block by block, and where it did the right eye's sky failed the depth test: black
+squares of 16x16 of the scene's pixels, for a second or two after the picture changed size.
+A pass that clears a target now waits for the passes before it (`Scheduler::BeginRendering`);
+the GPU takes no measurable time more for it (the first level, the two ways taking turns in
+one run). Found with `SHADPS4_DBG_EYE_SCAN` in a worn session, then made to happen at will in
+the sandbox by changing the size every four seconds: 8 to 12 pictures with squares a run
+before, none after. Also: the card on the controls no longer comes up as the game starts,
+only when OPTIONS (the menu button) is pressed.
+
 **App 0.8 (2026-10-03)**, after the fourth session (levels 1-1 to 1-3 played, the game stopped
 on entering 1-4 twice):
 
@@ -235,8 +432,11 @@ adb push games/CUSA12392 /data/local/tmp/astro/games/        # 13 GB, a few minu
 
 To play with a gamepad, pair it with the headset (Settings ▸ Bluetooth; on a DualSense, hold
 Create + PS until the light bar flashes); the headset's own controllers need nothing. Then start
-**Astro VR Host** from the app library (Unknown Sources). A floating panel reports what the app
-is doing, and what the game will be played with, until the game's first frame arrives.
+**Astro VR Host** from the app library (Unknown Sources). A panel in front of you reports what
+the app is doing, and what the game will be played with, until the game's first frame arrives.
+It stands still in the room where you faced when it appeared, and does not follow your head;
+the headset's own reset of the view brings it back in front of you, and so does putting the
+headset back on.
 With a gamepad, put the Touch controllers aside: with them out of the way the headset tracks
 your hands, which is what places the gamepad in the game. See "Controllers" below for what
 plays how.
@@ -267,9 +467,11 @@ Optional settings go in `/sdcard/Android/data/com.astrobotquest.vrhost/files/vrh
 
 | Setting | Meaning |
 | --- | --- |
-| `refresh_rate=72` | display refresh rate to ask for (72, 80, 90, 120; default 90). It decides which frame rates the game can keep in step with the display: 45 or 30 frames a second at 90 Hz, 36 at 72, 40 at 80, 60, 40 or 30 at 120, see "Speed" |
-| `pace=2` | how many refreshes of the display every frame of the game is given. `2` is the game's own way, as up to version 0.6; a larger number holds it to that. Default: the emulator chooses, see "Speed" |
-| `resolution=960` | the size the game draws its scene at, per eye: `816` (x870), `960` (x1080), `1200` (x1280), `1440` (x1536), or `game` for the game's own choice. Default: the emulator chooses, as large as the GPU manages at the pace, see "Speed" |
+| `refresh_rate=90` | display refresh rate to ask for (72, 80, 90, 120; default 90, or what the start-up menu's *Display refresh rate* was set to last). The game runs at 30 frames a second at 90 and 120 Hz (every frame shown three or four times), at 36 at 72 Hz and 40 at 80, see "Speed". Seeds the start-up menu |
+| `pace=2` | how many refreshes of the display every frame of the game is given. `2` is the game's own way, as up to version 0.6; a larger number holds it to that. Default: as many as make 30 frames a second (3 at 90 Hz, 4 at 120), and only the picture's size changes with what the GPU has time for, see "Speed" |
+| `resolution=960` | the size the game draws its scene at, per eye: `816` (x870), `960` (x1080), `1200` (x1280), `1440` (x1536), or `game` for the game's own choice. Default: the emulator chooses, as large as the GPU manages at 30 frames a second up to `largest_resolution=`, see "Speed" |
+| `fsr=0` | the game enlarges its picture itself, bilinearly, as on the console. Default: AMD's FSR 1 in the middle of the view, wherever the game draws it smaller than 1440x1536 (crisper edges, about 0.65 ms of the GPU a frame). Seeds the start-up menu's *Picture enlarged with* |
+| `largest_resolution=1440` | the largest size the emulator chooses: `816`, `960`, `1200` (the default) or `1440`. A larger one makes the picture sharper where a scene is light, and changes of size (each costs a few late frames) more frequent; `960` changes it least |
 | `antialias=0` | leave edges as jagged as the game draws them without multisampling. Default: the emulator smooths them, see "The picture" |
 | `real_time=0` | let the game count time in frames as on the console: slow motion whenever a frame takes longer than 1/60 s. Default: the emulator has it run by the clock, see "Speed" |
 | `hands=0` | do not use hand tracking; a gamepad stays at its fixed spot |
@@ -288,6 +490,8 @@ Optional settings go in `/sdcard/Android/data/com.astrobotquest.vrhost/files/vrh
 | `dynamic_resolution=0` | do not ask the system what size it recommends for the picture (which may cost the GPU its fastest clock). `2`: also show the picture at that size, as up to version 0.6. Default: ask, and show the picture at full size, see "The picture" |
 | `cpu_boost=0` | do not ask for the processor's "boost" level (its fastest clock, which the system grants for the first 45 seconds and up to a fifth of the time after) |
 | `fov=100` | Initial choice in the startup FOV menu, from 50–100% of the user's headset projection tangents. The last menu choice is used when this setting is absent; the first-launch default is 85. `100` fills the runtime-reported headset FOV and adds no mask. Lower values render the same pixels over fewer degrees, with a soft squircle border around each eye. The menu's angles and average PPD gain are calculated from this headset's detected optics; the chosen FOV is logged in host.log and core.log. |
+| `foveation=0` | Initial choice for "Foveated rendering" in the start-up menu: 0 every pixel shaded on its own, 1 (Low), 2 (Medium, the default), 3 (High) and 4 (Very High) more and more of the picture's edges shaded in blocks of 2x2 pixels (3: the far corners in 4x4, 4: the outer three fifths), see "Foveated rendering" under "Speed". The last menu choice is used when this setting is absent |
+| `detail=console` | Initial choice for "Detail further away" in the start-up menu: the game draws everything as on the console. The default, `lighter`, has its models change to their simpler forms at a third of the game's distances (`SHADPS4_TITLE_LOD=0.333`), a sixth less GPU time in level 3-2, and the sun's shadows drawn into maps of 1024x1024 instead of 2048x2048 (`SHADPS4_TITLE_SHADOW_MAP=1024`). The last menu choice is used when this setting is absent |
 | `mic=0` | the game does not get to hear the headset's microphone (see "Microphone") |
 | `mic_gain=2` | make what the game hears that many times louder (0.1–30) |
 | `arg=...`, `env=NAME=value` | extra emulator argument / environment variable |
@@ -326,8 +530,8 @@ two things the game is built around, which are made up for:
     That is the catapult at the end of every level (point the controller at the goal: the
     game only shoots within 25 degrees of it), and it pulls on the hook's rope.
 
-  A card in the headset names them when the game starts and again whenever OPTIONS is
-  pressed, which is the game's pause. Besides them the right stick, for which this game has
+  A card in the headset names them whenever OPTIONS is pressed, which is the game's pause
+  (not as the game starts, where it was in the way). Besides them the right stick, for which this game has
   no use either, moves a finger over the pad for anything else: the finger comes down behind
   the pad's middle, is dragged the way the stick is pushed, and lifts where the stick is let
   go (not back in the middle, where a stick flies to). The Create / Back / View button
@@ -422,8 +626,13 @@ not, and in the first two sessions the whole game ran at little more than half i
 (the engine keeps its step in three variables, written by the one function that sets its frame
 rate; `src/core/known_title.cpp`). Slowed down to 43, 30 and 22 frames a second, the PC build
 then follows the same course to the second as at 60, and a scripted walk through the first level
-has the hero in the same places at the same moments. Below 20 frames a second the game slows
-down rather than take steps its physics were never tried with. `real_time=0` turns this off.
+has the hero in the same places at the same moments. Below 30 frames a second the game slows
+down rather than take steps it was never tried with. Up to 0.20 that limit was 20, and at 30
+frames a second the frames after every hitch were given longer steps to catch up; with steps of
+37 ms and more (35 still pass) something in the game comes out as no number at all. In level
+3-2 that left the robot that hangs tied up there at no place from the moment the level loaded,
+and its cry for help, which fades with distance, was heard at full strength wherever the player
+was, for most of the level. `real_time=0` turns this off.
 
 **A time step that changes, and the collisions the game moves.** One thing in the game did
 depend on every frame's step being the same. The collisions of whatever moves (a platform, a
@@ -453,12 +662,19 @@ refresh; the emulated headset keeps step with those and refreshes at the moment 
 has the game's frames arrive midway between two looks of the app (a clock of its own would
 drift against the display). From 0.7 on it refreshes more slowly than the display wherever the
 game cannot keep the display's pace: one and a half times as slowly, so that the game's two
-refreshes are three of the display's. The app asks for 90 Hz now. That makes 45 frames a second
+refreshes are three of the display's. From 0.7 the app asked for 90 Hz: 45 frames a second
 where the game manages a frame in two refreshes (title, menus, world map, lighter scenes) and
 30 where it takes three (the levels), and either way every frame is on show for exactly as long
 as the next. In the self-test, with a display and a compositor of 90 Hz standing in, 292 to 300
 of 300 frames stay for exactly three refreshes in the first level's ordinary views, and 87 to
-96 of 100 in its heaviest. Head movement is smooth at the display's rate regardless: the
+96 of 100 in its heaviest. The start-up menu's *Display refresh rate* offers 120 Hz as well:
+60 frames a second for two refreshes, 40 for three, 30 for four, so that levels which cannot
+make the 22 ms of 45 frames a second get 40 wherever a frame takes no more than 25 ms instead
+of falling to 30. But the compositor's work at every refresh, about 1 ms of the GPU at a field
+of view of 80% (0.6 to 0.8 at 100%), is then done four times for each frame of 30 instead of
+three, and what it takes the game does not have: 90 Hz is the default again since the night
+of 2026-10-09, when the emulator also stopped trading the picture's size for 40 frames a second
+(see "The size of the picture" below). Head movement is smooth at the display's rate regardless: the
 compositor turns the last frame to where the head points by now.
 
 Frames are never given more refreshes than still makes 30 frames a second: a game that cannot
@@ -478,20 +694,56 @@ headset. It chooses the size by how long it finds the GPU to take over a frame, 
 the clock it reads for that says how long the emulator took to pass the drawing on, not how
 long the GPU needs for it. The emulator therefore chooses in its place, pace and size together
 (`Governor` in `src/core/known_title.cpp`). It looks eight times a refresh whether the GPU
-still has work of the game's before it, and goes by that and by how long frames take:
+still has work of the game's before it, and at the GPU's clock: a GPU with little to do slows
+its clock down and is then busy for longer with the same work, so its work is counted at the
+fastest clock it was seen to run at. It goes by that, by how long frames take, and by how much
+of the processor the thread that translates the game's drawing uses a frame:
 
 - frames that fit the refreshes they are given take exactly that long, on average; frames that
   take 3% longer do not fit;
-- the pace is the fastest at which 960x1080, the console's own smallest, fits the GPU's time
-  with a tenth to spare. Only at the slowest pace there is (30 frames a second) will 816x870 do;
-- the size is the largest that fits the pace with 15% to spare, by what the sizes were seen to
-  cost (the three larger ones are counted as 8%, 27% and 54% more GPU time than 816x870, the
-  upper end of what was measured);
-- when frames stop fitting and the GPU is what holds them up (busy 85% of the time or more), it
-  goes straight to the size, and if need be the pace, that the GPU's time says will fit; when
-  it is the game's own work that takes long, to the next pace;
-- a step up, in size or in pace, that had to be taken back within seconds makes the next one
-  wait twice as long (6 seconds to 2 minutes), and counts the size as dearer.
+- in the Quest app the pace is held to 30 frames a second throughout (three refreshes at 90 Hz,
+  four at 120; `SHADPS4_VR_STEADY_FPS=30`), and only the size changes. Where the pace is left to
+  the emulator (`SHADPS4_VR_STEADY_FPS` not set, as on the PC), it is the fastest at which
+  960x1080, the console's own smallest, fits with a quarter to spare: the GPU's work (counted
+  as if a smaller picture saved little), the translating thread's time, and the game's own work
+  where a try at that pace showed it to be too much (until the scene is clearly lighter, or ten
+  minutes later). It is only tried after five seconds in which all of that held. Only at the
+  slowest pace (30 frames a second) will 816x870 do: 960x1080 at 30 frames a second comes
+  before 816x870 at 40, and 816x870 before fewer than 30;
+- the size is the largest that fits the pace with a tenth to spare, up to the largest allowed
+  (`SHADPS4_VR_LARGEST_SIZE`; the Quest app allows 1200x1280 unless `largest_resolution=` says
+  otherwise). A step up to a larger one is taken only after four seconds in a row in which it
+  would have fitted with a fifth to spare (a frame that came late, or one that held everything
+  up, starts the count again), not within ten seconds of any change of size or pace, and not
+  in the 15 seconds after the pace got faster. The sizes are counted as costing a little more
+  than half as much as 816x870 plus their pixels (960x1080 1.21 times 816x870, 1200x1280 1.52,
+  1440x1536 1.95). What every step between two sizes really cost (the GPU's work a frame in the
+  windows before against two windows from half a second after) goes to the log; it does not
+  change what the sizes are counted as, since while the player moves a step shows as much of
+  the view changing as of the size (counted, the steps had drifted to looking almost free in
+  the session of the morning of 2026-10-09, which made steps up eager). Measured with the
+  headset's GPU at a fixed pace and the sizes taking turns in one run, with the models lighter
+  and the edges shaded coarsely: in 3-2, 960x1080 cost 1.21 times what 816x870 did and
+  1200x1280 1.20 times what 960x1080 did; in the first level, with 1600 draws a frame, 960x1080
+  cost only 1.10 times 816x870. Up to the night of 2026-10-09 the sizes were counted at 1.35,
+  1.87 and 2.59 and a step up needed a quarter to spare, which held the first level of the
+  session that night at 816x870 all through, with the GPU busy 76 to 82% of the time in its
+  ordinary views;
+- when frames stop fitting and the GPU is what holds them up (busy 85% of the time or more), a
+  step up in size from the last half minute is taken back; otherwise it goes straight to the
+  size that the GPU's time says will fit, and (where the pace is the emulator's to choose) to
+  the next pace only where no size does; when it is the game's own work that takes long, to
+  the next pace;
+- a faster pace that had to be taken back makes the next try wait 20 seconds, then twice as long
+  each time (up to 2 minutes); a size that had to be taken back counts as dearer (6% at a time,
+  20% at most, and as before after two seconds of loading in which nothing was drawn), and the
+  next step up waits 15 seconds, then twice as long each time.
+
+In the sandbox at 120 Hz, from the title into 3-2 (290 seconds): before, the frame rate went
+from 40 to 60 and back to 40 within seven seconds, and the size changed every few seconds at
+the start; with these rules it changed pace five times, never on a try that failed, and held
+40 frames a second at 960x1080 for the last two and a half minutes. It went to 30 only in the
+heaviest view, where the translating thread needed 23 ms a frame.
 
 Up to 0.6 the size went back and forth between 816x870 and 960x1080 all through the first
 level (fourteen times in six minutes of the third session): at 72 Hz the smaller one used 78 to
@@ -547,6 +799,13 @@ What made the difference, in the core (`shadps4-arm64-main`):
   own.)
 - The GPU driver draws directly instead of in tiles (`TU_DEBUG=sysmem`, set by the app while
   multisampling is off).
+- Since 0.21: the GPU driver's shader compiler puts no "preamble" before the game's
+  shaders (`IR3_SHADER_DEBUG=nopreamble`, set by the app). A preamble is the part of a shader
+  that is the same for a whole draw, worked out once at its start; with about 1700 mostly small
+  draws a frame that costs the GPU more than it saves. 0.53 ms a frame less without (2.6%: the
+  first level at 30 frames a second, four whole runs in the order with, without, without, with;
+  20.05, 19.57, 19.54 and 20.12 ms). The driver keeps the shaders it compiled before apart from
+  these, so the first start with it compiles each shader again as the game first uses it.
 
 What is left is what the game draws. Looking down the first level that is about 8 million
 vertices a frame (shadow maps a third, a depth pass for each eye a fifth, the two colour passes
@@ -581,11 +840,154 @@ Tried and dropped: FEX without x86 memory ordering (`SHADPS4_FEX_TSO=0`) - the g
 half a minute. The driver without its lowering of uniform buffers to constants
 (`IR3_SHADER_DEBUG=nouboopt`) - the same GPU time. Not setting vertex layout, vertex and index
 buffers and push constants again when they are what the command buffer already has (half of
-those calls) - no difference to the GPU or to the thread that makes them.
+those calls) - no difference to the GPU or to the thread that makes them; tried again on
+2026-10-11 for push constants and descriptors within a render pass (three quarters of the
+constants' pushes, none of the descriptors', which change with every draw), in turns in one run
+on the headset: the GPU's time the same within the noise (0.1 ms). The driver's early depth test
+(LRZ) switched off while
+the game runs (`TU_DEBUG_FILE`) - the GPU stopped for good within three minutes.
 
 The app has the core log, every five seconds, the frame rate, what a frame consists of and how
 long it takes on each part of its way ("frame path", `SHADPS4_FRAME_STATS=1`). The tools under
 "Testing on the headset" show where GPU and processor time go.
+
+### What the GPU thread does for a draw
+
+One thread of the emulator turns the game's drawing into Vulkan commands. In the world select
+(about 1770 draws a frame) it needed 28 ms of the processor a frame in the sandbox, 15.7
+microseconds a draw; in 3-2 (1016 draws) 14.6 ms. A sampled profile of it
+(`ASTRO_THREAD_SAMPLES`) put a fifth of that into finding the pipeline for each draw, which
+meant working out again, for every shader of every draw, what kinds of resources it is given
+and comparing that with the variants made so far; a sixth into finding the images behind its
+textures; a quarter into the GPU driver itself.
+
+Most draws give their shaders resources of the same kinds as some draw before them, and bind
+textures that a draw before them bound. Both are now remembered: a shader's variant by every
+word of its resources' descriptions except where they are (`Recognize` in
+`vk_pipeline_cache.cpp`, checked word for word), the pipeline the draw before got, and a
+texture's image by its whole descriptor while no image has come or gone
+(`TextureCache::FindTextureImage`, and the view an image was last asked for). Run with
+`SHADPS4_DBG_CHECK_RECOGNIZE=1`, the PC build also takes the long way at every shortcut and
+compares: through 3-2 and through the first level, 0 differences in 50 million shader lookups
+and 70 million texture lookups. In the sandbox, the shortcuts switched off and on every ten
+seconds of one run (`SHADPS4_DBG_AB`): the world select 27.8 instead of 23.7 ms a frame for
+the pipelines alone, then 22.4 instead of 20.2 ms for the textures on top; in 3-2 11.8 instead
+of 14.6 ms a frame for both.
+
+The driver's own share (`SHADPS4_DBG_CALL_TIMES=1`, the world select): 6 ms a frame, of which
+2.1 ms pushing the descriptors of every draw, 1.6 ms the draw calls themselves and 0.6 ms
+binding pipelines. Recording the commands on a second thread could take that off this one, but
+the two would have to hand work to each other some 100 times a frame on the three cores a VR
+session gives the emulator, where the game's own threads are as busy; not done. Of the small
+buffers a draw reads (constants, short vertex and index lists), copied for every draw: about
+7000 a frame in 3-2, 7 MB, four fifths of them copied before in the same frame. They are 1 KB
+on average, and since the game may change one between two draws, reusing a copy means reading
+the memory again to make sure; that was not worth it.
+
+Where the processor limits the frame rate now is mostly the game's own work: in 3-2 it hands a
+frame's drawing over within 19 ms of starting it, against 12 ms for the thread above.
+
+**Drawing both eyes at once** (the GPU drawing every object for the two eyes in one go, which
+the headset's GPU can do) was measured before anything was built for it. The second eye's
+scene is 42% of a frame's draws in 3-2. Left out altogether (`SHADPS4_DBG_SKIP_SECOND_EYE=1`, a
+measuring aid; that eye then shows what the first saw), the GPU's work a frame drops by roughly
+40% (counted at its clock), the translating thread's time by 16% (the aid leaves out only the
+last part of translating a draw; all of it would be up to 40%), and the game's own processor
+time not at all (19.2 ms either way). Drawing both at once would save less than that on the
+GPU: every pixel of the second eye still has to be shaded, only the draws themselves and part of
+the geometry would be shared. And the game draws the eyes one after the other into the same
+images, with its effects in between; the emulator would have to hold the first eye's drawing
+back until the second's has come, pair them draw by draw, keep a second layer of every image
+the eyes are drawn into, and give each eye its own constants inside the same shaders. That is
+a large piece of work for what is, where the game's own processor time decides the frame rate,
+little; not done.
+
+Measured again on the night of 2026-10-09 in the first level (1600 draws a frame, the models
+lighter, 816x870, the GPU's time counted at 690 MHz): the second eye's scene costs 5.6 ms of a
+15.5 ms frame; drawn with one triangle a draw (`SHADPS4_DBG_SKIP_SECOND_EYE=2`) it still costs
+1.9 ms, which is what its 590 draws cost as such (about 3 microseconds of the GPU each). Drawing
+both eyes at once would save about that, and some of the second eye's vertices (it has 2.2
+million): 2.5 to 3 ms, a sixth to a fifth of a frame in this level, more than in 3-2. Against
+that, the first eye's drawing would wait for the second's: the GPU thread has the second eye's
+first draw 4 to 6 ms after the first eye's in this level (`SHADPS4_DBG_STEREO_TIMING=1`), time
+in which the GPU could then only work on the shadows. A build of it, with the pairing of the
+draws, a second layer of every image the eyes are drawn into and the shaders' constants for
+each eye, is weeks of work; still not done. With every draw cut to one triangle a frame of
+the first level takes 6.6 of its 15.2 ms: what a draw costs as such, for all of them, is the
+largest part of what is left.
+
+### What a frame costs the headset's GPU
+
+Measured on 2026-10-08 in level 3-2 (INDY CAVE 1), where a player's session in app 0.20 ran
+at 20 to 30 frames a second at the smallest size (816x870 an eye), with the GPU at the 599 MHz
+a VR session allows and busy 99% of the time. In the sandbox, at the same size, the GPU at its
+690 MHz and the game held to 45 frames a second, a frame took 20.1 ms of the GPU's time. In a
+session that is about 23 ms at 599 MHz, and the compositor needs its share on top: more than
+the 22.2 ms that 45 frames a second leave, so the game drops to 30.
+
+`SHADPS4_GPU_PROFILE=<seconds>` (`src/video_core/renderer_vulkan/vk_gpu_profile.cpp`) times
+every draw and dispatch of one frame on the GPU, one by one, and lists what the time went to,
+pass by pass, by target and by shader. A frame of 3-2 is about 1000 draws and 7.4 million
+vertices: two shadow maps (2048x2048, 1.9 million vertices), then for each eye a depth pass
+(200 draws, 1 million vertices) and the colour pass (220 draws, 1.7 million vertices), then a
+small amount of post-processing. The colour passes are two thirds of the GPU's time, the
+depth passes a seventh, the shadow maps a tenth, everything after them a few percent.
+Drawn with a quarter of the pixels (`SHADPS4_DBG_VIEWPORT_SCALE=0.5`) the frame takes 13.4
+instead of 20.1 ms: shading pixels is a bit less than half of it, the geometry and the draws
+themselves the rest. Particles and other effects are not where the time goes.
+
+The game has its own settings for what it draws, in its scene parameter files (`.spx`, XML;
+`src/core/known_title_scenes.h`): at which distances models change to their simpler forms,
+the size of the sun's shadow maps, whether depth is drawn on its own before the colours. The
+emulator can hand the game changed copies of them (`SHADPS4_TITLE_LOD=<share>`,
+`SHADPS4_TITLE_SHADOW_MAP=<1024|1536>`, `SHADPS4_TITLE_DEPTH_PREPASS=0`; the copies are made
+from the game's own files at run time, in the emulator's cache folder). Measured in 3-2 as
+above, GPU time a frame:
+
+| Setting | GPU time | |
+| --- | --- | --- |
+| the game's own | 20.1 ms | 7.4 million vertices a frame |
+| models simpler at half the distances | 17.9 ms | 4.7 million |
+| models simpler at a third of the distances | 17.0 ms | 3.7 million; the start-up menu's "Lighter" |
+| shadow maps 1024 instead of 2048 | 19.5 ms | the shadows' cost is their geometry, not their size |
+| no depth pass | 22.5 ms | slower: without it the colour pass shades what is hidden |
+
+In the first level and in 3-2, pictures taken with the models at a third of the distances
+differ from the game's own in fewer than one pixel in a hundred, along edges. What the world
+select draws does not change (its own file has every model in full up to 1000).
+
+**Foveated rendering** (`foveation=`, the start-up menu's third line; `SHADPS4_VR_FOVEATION`,
+`src/video_core/renderer_vulkan/vk_foveation.cpp`). The edges of each eye's scene, where the
+lenses show less, are shaded in blocks of 2x2 pixels instead of pixel by pixel. Shapes and
+their edges are drawn as before, every pixel with its own depth; only the colour inside a
+block is worked out once for all four. The GPU does that by a small map of how coarsely to
+shade each part (`VK_KHR_fragment_shading_rate`, which the headset's driver offers in the
+direct mode the game is drawn in: one texel of the map for 8x8 pixels), given to the render
+passes that draw the scene for an eye (those at the size the scene is drawn at, not the
+picture handed to the headset). The map is centred on straight ahead, which the symmetric
+projection the app asks for puts in the middle of the picture. In 3-2 as above, with the
+models at a third of the distances:
+
+| Level | Shaded in blocks | GPU time |
+| --- | --- | --- |
+| Off | nothing | 17.0 ms |
+| Low | the outer half (by area: the corners are a lot of it) | 15.1 ms |
+| Medium, the default | seven tenths, from 62% of the way out | 14.3 ms |
+| High | four fifths, the far corners in blocks of 4x4 | 12.8 ms |
+| Very High | nine tenths, the outer three fifths in blocks of 4x4 | about 5% less than High |
+
+Together with the lighter models that is 14.3 instead of 20.1 ms a frame at the default. With
+the emulated headset at 120 Hz and the emulator choosing pace and size, 3-2 in the sandbox
+settles at 40 frames a second at 1200x1280 that way, against 30 at 960x1080 with the game's
+own settings. A session has less of the GPU (599 MHz, and the compositor's share): 40 frames
+a second at a smaller size is what to expect there. Not yet tried worn. Up close, the blocks
+show on fine, bright texture (the glitter of a floor) in the outer part of the picture; at
+High the far corners are visibly coarse, and at Very High most of the picture's outer part.
+Very High was measured against High in the same run, the two taking turns every ten seconds
+(`SHADPS4_DBG_AB_ONLY=fov`, 30 frames a second): in 3-2 at 960x1080, 11.6 instead of 12.3 ms
+of the GPU a frame (5.5% less); in the first level at 816x870, 14.7 instead of 15.2 (3%). Not
+much more: most of what a frame costs the GPU there is not the shading of the picture's
+pixels (the depth pre-pass, the shadow maps, and what every draw costs whatever its size).
 
 ### The headset's own performance features
 
@@ -605,12 +1007,14 @@ What Meta offers apps for speed, and what each can do for a game that is drawn b
   What the compositor does do with every frame, at the display's rate, is turn it to where the
   head points by now. That is the same reprojection PlayStation VR used to show this game's 60
   frames at 120 Hz.
-- **Fixed foveated rendering** makes the GPU draw the edges of the image an app renders into at
-  a lower resolution. The image this app renders into only receives a copy of the finished
-  picture, which is no work to speak of. The picture itself is drawn by the emulator into the
-  game's own targets; there the driver could only do it in its tiled mode, which halves the
-  frame rate of this game (it is the geometry that is expensive, not the pixels, and the game
-  already draws at its lowest resolution, with the area the lenses cannot show masked out).
+- **Fixed foveated rendering**, as the system offers it, makes the GPU draw the edges of the
+  image an app renders into at a lower resolution. The image this app renders into only
+  receives a copy of the finished picture, which is no work to speak of; the picture itself is
+  drawn by the emulator into the game's own targets. So the emulator does it there, itself:
+  see "Foveated rendering" under "What a frame costs the headset's GPU" (`foveation=`). (The
+  system's way of doing it, a fragment density map, the driver only does in its tiled mode,
+  which halves this game's frame rate; shading rates by a map, which it uses instead, work in
+  the direct mode the game is drawn in.)
 - **Super Resolution** is the better of the two filters the compositor can enlarge the picture
   with. Left to the system (the default up to 0.6) it was off two thirds of the time in a
   level; `sharpen=2` now asks for it unconditionally, the default is the emulator's own
@@ -752,6 +1156,11 @@ game does with time and with the head, on a machine that is fast enough for anyt
 | `SHADPS4_FRAME_STATS=1 SHADPS4_FRAME_STATS_EVERY=1` | frame rate and draws per frame every second: what the game shows over time, as a fingerprint of where it is |
 | `SHADPS4_VR_REFRESH_RATE=<Hz>` | how often the emulated headset refreshes (60 to 120); the game draws half as many frames |
 | `SHADPS4_VR_PACE=<2..6>` | how many of those refreshes every frame is given: 3 at 90 Hz makes 30 frames a second on the dot (without it the emulator chooses, which on a PC is always 2) |
+| `SHADPS4_TITLE_FSR=<0..2>` | the known title's final pass reads its scene with FSR 1 EASU instead of bilinearly (its pixel shader is compiled with the filter in it): 1 where it is enlarged by 1.3 or more, 2 wherever it is enlarged (what the app asks for), 0 (the core's default) never. `SHADPS4_DBG_AB_ONLY=fsr` measures it |
+| `SHADPS4_TITLE_FSR_HALF=0`, `SHADPS4_TITLE_FSR_FLAT=0` | the filter in 32 bits instead of 16; the filter also where the four nearest texels are all but the same. `SHADPS4_DBG_AB_ONLY=fsrhalf,fsrflat` measures them (several names may be given) |
+| `SHADPS4_VR_SHARPEN_FSR=<0..1>` | how much the eyes' pictures are sharpened in the part FSR 1 made (default: half of `SHADPS4_VR_SHARPEN`) |
+| `SHADPS4_VR_LARGEST_SIZE=<3..6>` | where the emulator chooses the scene's size, none larger than that (3 = 816x870 ... 6 = 1440x1536; the Quest app sets 5 unless `largest_resolution=` says otherwise) |
+| `SHADPS4_VR_STEADY_FPS=<fps>` | frames are given as many refreshes as make that many frames a second or more, throughout, and only the scene's size changes with what the GPU has time for (the Quest app sets 30 unless `pace=` is set) |
 | `SHADPS4_TITLE_TIMESTEP=0`, `SHADPS4_TITLE_RESOLUTION=<3..6 or title>` | the game's time step left alone; its scene held to one size (3 = 816x870 ... 6 = 1440x1536) or left to the game |
 | `SHADPS4_TITLE_PHYSICS_STEP=0`, `SHADPS4_TITLE_PHYSICS_WATCH=1` | the game's physics step left as the console has it (collisions that are moved then land off, see "Speed"); a line in the log every ten seconds on how far the bodies the game sent somewhere ended from there |
 | `SHADPS4_MAX_MSAA=<1, 2, 4>` | the most samples a pixel gets; 1 is what the headset runs with, and has the emulator smooth edges itself unless `SHADPS4_RESOLVE_AA=0` |
@@ -785,6 +1194,22 @@ Settings of `quest-sandbox-test.sh` for looking into speed (all described at the
 | `ASTRO_GPUTRACE_AT=<s>` | the driver's own trace from that second on; `tools/gputrace.py run/gputrace.txt <fps>` sums it up per kind of render pass |
 | `ASTRO_THREADS_AT=<s> ASTRO_THREAD_SAMPLES="1500 shadPS4:GpuComm"` | a sampling profile of one thread; `node tools/symbolize-stacks.mjs --thread shadPS4:GpuComm --profile` prints it |
 | `ASTRO_AT="<s>:<command>;..."` | shell commands at given times, e.g. to switch driver options through `TU_DEBUG_FILE` |
+| `SHADPS4_GPU_PROFILE=<s>` (as an argument) | every that many seconds, one frame timed on the GPU draw by draw (that frame is slower): pass by pass, by target and by shader, with what the emulator itself had the GPU do between the draws (uploads, copies, barriers, where passes ended) and the longest waits, in `run/core.log` and `run/profile.txt`; also on the PC build |
+| always | `run/pacing.txt`: frame rate, frame path and every change of pace and size, from the whole log (`run/core.log` keeps only its first 6 MB and its end) |
+| `SHADPS4_DBG_AB=<s>` (as an argument) | the changes that ask for it (`FrameStats::AbOff`) are made and left out by turns, that many seconds each; every "frame stats" line says which (`[A]` made, `[B]` left out). `SHADPS4_DBG_AB_ONLY=pipelines`, `textures` or `eye2` limits it to one. Compares under the same heat and in the same scene, which runs after one another do not: the headset gets slower as it warms up |
+| `SHADPS4_DBG_CALL_TIMES=1` (as an argument) | how long the calls into the GPU driver that every draw makes take, kind by kind, a line a frame-stats window |
+| `SHADPS4_DBG_CHECK_RECOGNIZE=1` | at every shortcut of the pipeline and texture lookups the long way is taken too, and a difference is logged as an error |
+| `SHADPS4_DBG_SKIP_SECOND_EYE=1` (as an argument) | the second eye's scene is not drawn (that eye shows what the first saw): what it costs. `=2` draws it with one triangle a draw: what is left is what its draws cost as such, which drawing both eyes at once would save. With `SHADPS4_DBG_AB` as `eye2` |
+| `SHADPS4_DBG_STEREO_TIMING=1` | every ten seconds, how long after the first eye's first scene draw the second eye's first one reaches the GPU thread, and when the first eye's picture was done in between: what drawing both eyes at once would hold the first eye back by |
+| `SHADPS4_DBG_AB_ONLY=<name>` | the changes that can be left out by turns: `ubo` (the game's constants as uniform buffers), `skipempty` (draws that write nothing left out), `size` (with `SHADPS4_TITLE_RESOLUTION`: the "B" frames a size larger), `ppcopy` (the eyes' copy without a clear and through UNORM views: only in the self-test, the sandbox has no copy), `resolveaa` (resolves copied as they are instead of smoothed), `fxaafine` (smoothed all over instead of in the fovea's fine middle), `onetri` (with `SHADPS4_DBG_DRAW_VERTICES`), `pipelines`, `textures`, `eye2`, `clearbarrier` (the barrier before a pass that clears a target: without it, black squares in the right eye after a change of size; costs nothing measurable) |
+| `SHADPS4_DBG_NO_SHADOW_TAPS=1` | pixel shaders read every depth-compared sample (the taps that filter a shadow's edge) as fully lit: what those taps cost. No shadows |
+| `SHADPS4_MAX_ANISO=<n>` | no more than n samples along a texture seen at a slant; the log names the ratios the game asks for (2x and 4x in the first level) |
+| `SHADPS4_TITLE_PREPASS_DISTANCE=<m>`, `SHADPS4_TITLE_PREPASS_RADIUS=<m>` | how far away models still get the depth pre-pass, and how small they may be (the headset's base scene file sets neither; the television's has 10 and 0) |
+| `SHADPS4_UBO=0` / `=1` | the game's constants as storage buffers / as uniform buffers (on by default with the headset's driver only) |
+| `SHADPS4_DBG_EYE_SCAN=<n>` | every n-th frame both eyes' pictures (and, in a session or the self-test, the picture handed to the app) are read back and looked over for black blocks in one eye only, or that were lit at the look before: each is logged ("Eye scan at ...") and pictures of such moments go to `eye_scan/` in the core's user folder, one set a minute to compare with. Works in a real session too, through `env=` in `vrhost.txt` |
+| `SHADPS4_DBG_TRACE_HMD_FRAMES=<frame>,...` / `SHADPS4_DBG_DUMP_HMD_FRAMES=<frame>,...` | the draws after those frames in the log (targets, depth and stencil state, clears, copies) / every render target as a picture in `rt_dump-<frame>/` |
+| `SHADPS4_DBG_TRACE_SIZE_CHANGE=<s>[,<frames>]` | with `SHADPS4_DBG_RESOLUTION_CYCLE`: the draws from so many frames after the first change of size that many seconds in |
+| `SHADPS4_DBG_TRACE_IMAGES=1` | every image the texture cache takes on or lets go of, and every request answered with an image of another size |
 
 The sandbox is not a VR session: the core may only use three processor cores there, and the GPU
 clock follows the load instead of being held by the VR runtime.

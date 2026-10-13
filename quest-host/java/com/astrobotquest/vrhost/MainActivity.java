@@ -150,7 +150,8 @@ public class MainActivity extends Activity
     private static final int CONTROLLER_OWN_HELD = 4;
     /** Added where what the game is played with has no touchpad: buttons do its gestures. */
     private static final int CONTROLLER_GESTURE_BUTTONS = 8;
-    private static final int MENU_LEFT = 1, MENU_RIGHT = 2, MENU_CONFIRM = 4;
+    private static final int MENU_LEFT = 1, MENU_RIGHT = 2, MENU_CONFIRM = 4, MENU_UP = 8,
+            MENU_DOWN = 16;
 
     private static final int VENDOR_SONY = 0x054c;
     private static final int VENDOR_META = 0x2833;
@@ -165,6 +166,17 @@ public class MainActivity extends Activity
     private native void nativeSetMicrophone(boolean enabled, float gain);
 
     private native void nativeSetFieldOfView(int percent);
+    /** Has the display switch to that refresh rate now (the session runs while the menu is up). */
+    private native void nativeSetRefreshRate(float rate);
+    /** The refresh rates the display offers: bit 0 72 Hz, 1 80, 2 90, 3 120; 0 until known. */
+    private native int nativeRefreshRates();
+
+    /** Whether the display offers that rate (true while that is not known yet). */
+    private boolean offersRate(int rate) {
+        int offered = nativeRefreshRates();
+        int bit = rate == 72 ? 1 : rate == 80 ? 2 : rate == 90 ? 4 : rate == 120 ? 8 : 0;
+        return offered == 0 || (offered & bit) != 0;
+    }
 
     private native float[] nativeHeadsetFov();
 
@@ -233,13 +245,46 @@ public class MainActivity extends Activity
     private float[] headsetFov;
     private static final int FOV_MIN = 50, FOV_MAX = 100, FOV_STEP = 5;
     private long nextOwnFovMoveAt;
+    /**
+     * How much the game draws of what is further away: DETAIL_CONSOLE all of it, as on the
+     * console; DETAIL_LIGHTER has its models change to their simpler forms at a third of the
+     * distances the game has for that (SHADPS4_TITLE_LOD), and the sun's shadows drawn into
+     * maps of 1024x1024 instead of 2048x2048 (SHADPS4_TITLE_SHADOW_MAP). The headset's GPU
+     * then has noticeably less to do for a frame (a sixth less in level 3-2), and the
+     * difference is hard to see from the player's seat: shadows' edges are a little softer.
+     */
+    private int detail = DETAIL_LIGHTER;
+    private static final int DETAIL_CONSOLE = 0, DETAIL_LIGHTER = 1;
+    /**
+     * How coarsely the edges of the picture are shaded (SHADPS4_VR_FOVEATION), where the lenses
+     * show less of it anyway: 0 every pixel on its own, 1 to 4 more and more of the edges in
+     * blocks of 2x2 pixels (at 3 the far edges in 4x4, at 4 the outer part). Meta's own
+     * names for it are used, and one beyond them.
+     */
+    private int foveation = FOVEATION_DEFAULT;
+    private static final int FOVEATION_DEFAULT = 2, FOVEATION_MAX = 4;
+    /**
+     * How the game's picture is enlarged to the one it hands to the headset where it draws it
+     * smaller (SHADPS4_TITLE_FSR): with AMD's FSR 1 in the middle of the view (the default),
+     * which keeps edges crisper, or as the game does it itself (bilinear). FSR 1 runs inside the
+     * game's own final pass and takes the GPU well under a millisecond a frame.
+     */
+    private boolean upscaleFsr = true;
+    private static final String[] FOVEATION_NAMES = {"Off", "Low", "Medium", "High", "Very High"};
+    /**
+     * The line of the start-up menu that left and right change: view, detail, foveation,
+     * enlargement, refresh rate.
+     */
+    private int menuRow;
+    private static final int MENU_ROWS = 5;
+    private long nextRowMoveAt;
+    private long nextOwnRowMoveAt;
     /** The card that says which buttons do the touchpad's gestures: shown until then. */
     private long cardUntil;
     private boolean cardShowing;
-    /** Which controller it was last shown for, and the presses of OPTIONS counted then. */
-    private int cardShownFor;
+    /** The presses of OPTIONS counted at the last look. */
     private int optionsSeen;
-    private static final long CARD_AT_START_MS = 15000, CARD_ON_PAUSE_MS = 10000;
+    private static final long CARD_ON_PAUSE_MS = 10000;
     /**
      * What confirms the menu on the headset's own controllers has been seen let go while the
      * menu showed: the trigger that started the app from the headset's library is not it.
@@ -257,9 +302,22 @@ public class MainActivity extends Activity
     private long statsFrames = -1;
     private long statsTime;
     private String statsRate = "...";
-    private float refreshRate;
+    /**
+     * What the display is asked to refresh at, a line of the start-up menu. The game draws 30
+     * frames a second either way: at 90 Hz (the default) the headset's compositor makes three
+     * pictures of each, at 120 Hz four, which follow the head more smoothly but take the GPU a
+     * little more from the game. vrhost.txt's refresh_rate seeds it.
+     */
+    private float refreshRate = REFRESH_DEFAULT;
+    private static final int REFRESH_DEFAULT = 90, REFRESH_FASTER = 120;
     /** What SHADPS4_TITLE_RESOLUTION is set to, null to leave the choice to the emulator. */
     private String resolution;
+    /**
+     * The largest size the emulator chooses (SHADPS4_VR_LARGEST_SIZE): 1200x1280. The first
+     * level leaves the GPU room for it most of the time; 1440x1536 fits only in light scenes,
+     * and a heavy one that comes after them would be drawn too large for a second or so.
+     */
+    private String largestResolution = "5";
     private boolean realTime = true;
     private final List<String> extraArgs = new ArrayList<>();
     private final List<String> extraEnv = new ArrayList<>();
@@ -290,6 +348,13 @@ public class MainActivity extends Activity
         if (!dryRun) {
             fieldOfView = Math.max(FOV_MIN, Math.min(FOV_MAX,
                     getPreferences(MODE_PRIVATE).getInt("fov", fieldOfView)));
+            detail = getPreferences(MODE_PRIVATE).getInt("detail", detail) == DETAIL_CONSOLE
+                    ? DETAIL_CONSOLE : DETAIL_LIGHTER;
+            foveation = Math.max(0, Math.min(FOVEATION_MAX,
+                    getPreferences(MODE_PRIVATE).getInt("foveation", foveation)));
+            upscaleFsr = getPreferences(MODE_PRIVATE).getBoolean("fsr", upscaleFsr);
+            refreshRate = getPreferences(MODE_PRIVATE).getInt("refresh", REFRESH_DEFAULT)
+                    == REFRESH_FASTER ? REFRESH_FASTER : REFRESH_DEFAULT;
         }
         readSettings();
         choosingFov = !dryRun;
@@ -385,24 +450,25 @@ public class MainActivity extends Activity
 
     /**
      * Reads the optional vrhost.txt: one "key=value" per line.
-     *   refresh_rate=72        display refresh rate to ask for (72, 80, 90, 120). The game
-     *                          draws one frame for every two refreshes where the GPU manages
-     *                          that, and one for every three where it does not: 45 or 30
-     *                          frames a second at the 90 Hz asked for without this, and 60,
-     *                          40 or 30 at 120. At 72 and 80 Hz there is only the one pace
-     *                          (36, 40): frames are never given more refreshes than still
-     *                          makes 30 a second, below that the game draws as it can
+     *   refresh_rate=90        display refresh rate to ask for (72, 80, 90, 120). The game
+     *                          draws 30 frames a second at 90 Hz (the default) and at 120,
+     *                          every frame shown for three or four refreshes; 36 at 72 Hz and
+     *                          40 at 80. Seeds the startup menu
      *   pace=2                 leave it to the game how many refreshes a frame takes, as up to
      *                          version 0.6: it takes two, and one more whenever a frame is
      *                          late, so frames last unevenly where it only just keeps up. A
      *                          larger number holds every frame to that many refreshes. Without
-     *                          this the emulator chooses, see resolution
+     *                          this the game draws 30 frames a second throughout and the
+     *                          emulator chooses the size of the picture, see resolution
      *   resolution=960         the size the game draws its scene at, per eye: 816 (x870), 960
      *                          (x1080), 1200 (x1280) or 1440 (x1536), or "game" for the game's
-     *                          own choice. Without this the emulator chooses: the fastest pace
-     *                          at which 960x1080 (the console's own smallest) fits the GPU's
-     *                          time, 816x870 only where that would mean fewer than 30 frames a
-     *                          second, and then the largest size that fits that pace
+     *                          own choice. Without this the emulator chooses, by how busy the
+     *                          GPU is: the largest size that fits a frame's time with room to
+     *                          spare, up to largest_resolution
+     *   largest_resolution=1440  the largest size the emulator chooses: 816, 960, 1200 (the
+     *                          default) or 1440. A larger one makes the picture sharper where
+     *                          a scene is light, and changes of size (each a few late frames)
+     *                          more frequent; 960 changes it least
      *   antialias=0            leave edges as jagged as the game draws them here. The console
      *                          multisamples (see msaa), which this GPU cannot afford; by
      *                          default the emulator smooths edges in the finished scene
@@ -453,6 +519,21 @@ public class MainActivity extends Activity
      *                          pixels over fewer degrees is a sharper
      *                          picture, with a soft squircle border below 100. Default 85;
      *                          100 is the headset's own, 50 to 100. Seeds the startup menu
+     *   detail=console         the game draws all it draws on the console further away;
+     *                          lighter (the default) has its models change to their simpler
+     *                          forms at a third of the game's distances and the sun's shadows
+     *                          drawn at half the resolution, which takes the GPU less time.
+     *                          Seeds the startup menu
+     *   foveation=0            every pixel of the picture shaded on its own; 1, 2 (the
+     *                          default), 3 and 4 shade more and more of its edges in blocks of
+     *                          2x2 pixels (3: the far edges in 4x4, 4: the outer part in 4x4),
+     *                          where the lenses show less, which takes the GPU less time. Seeds
+     *                          the startup menu
+     *   fsr=0                  the game enlarges its picture itself (bilinear), as on the
+     *                          console; by default FSR 1 does it in the middle of the view,
+     *                          wherever the game draws it smaller than 1440x1536 (crisper
+     *                          edges, well under a millisecond of GPU time a frame). Seeds the
+     *                          startup menu
      *   mic=0                  the game does not get to hear the headset's microphone
      *   mic_gain=2             make what it hears that many times louder (0.1 to 30), if
      *                          blowing does too little or everything counts as blowing
@@ -481,6 +562,9 @@ public class MainActivity extends Activity
                 switch (key) {
                     case "refresh_rate":
                         refreshRate = Float.parseFloat(value);
+                        if (refreshRate <= 0) {
+                            refreshRate = REFRESH_DEFAULT;
+                        }
                         break;
                     case "resolution":
                         switch (value) {
@@ -501,6 +585,24 @@ public class MainActivity extends Activity
                                 break;
                             default:
                                 resolution = null;
+                                break;
+                        }
+                        break;
+                    case "largest_resolution":
+                        switch (value) {
+                            case "816":
+                                largestResolution = "3";
+                                break;
+                            case "960":
+                                largestResolution = "4";
+                                break;
+                            case "1200":
+                                largestResolution = "5";
+                                break;
+                            case "1440":
+                                largestResolution = "6";
+                                break;
+                            default:
                                 break;
                         }
                         break;
@@ -565,6 +667,16 @@ public class MainActivity extends Activity
                     case "fov":
                         fieldOfView = Math.max(FOV_MIN, Math.min(FOV_MAX, Integer.parseInt(value)));
                         break;
+                    case "detail":
+                        detail = value.equalsIgnoreCase("console") || value.equals("0")
+                                ? DETAIL_CONSOLE : DETAIL_LIGHTER;
+                        break;
+                    case "foveation":
+                        foveation = Math.max(0, Math.min(FOVEATION_MAX, Integer.parseInt(value)));
+                        break;
+                    case "fsr":
+                        upscaleFsr = !value.equals("0");
+                        break;
                     case "mic":
                         microphone = !value.equals("0");
                         break;
@@ -602,8 +714,15 @@ public class MainActivity extends Activity
         nativeSetPlaying(true);
         nativeSetFieldOfView(fieldOfView);
         if (!dryRun) {
-            getPreferences(MODE_PRIVATE).edit().putInt("fov", fieldOfView).apply();
-            logInfo("startup FOV chosen: " + fieldOfView + "%");
+            getPreferences(MODE_PRIVATE).edit().putInt("fov", fieldOfView)
+                    .putInt("detail", detail).putInt("foveation", foveation)
+                    .putBoolean("fsr", upscaleFsr)
+                    .putInt("refresh", Math.round(refreshRate)).apply();
+            logInfo("startup FOV chosen: " + fieldOfView + "%, detail: "
+                    + (detail == DETAIL_CONSOLE ? "as on the console" : "lighter")
+                    + ", foveated rendering: " + FOVEATION_NAMES[foveation]
+                    + ", enlargement: " + (upscaleFsr ? "FSR 1" : "the game's own")
+                    + ", display refresh rate: " + Math.round(refreshRate) + " Hz");
             if (inputView.hasWindowFocus()) {
                 inputView.requestPointerCapture();
             }
@@ -643,6 +762,12 @@ public class MainActivity extends Activity
                         + "/CUSA12392\n" + SHELL_GAMES + "/CUSA12392\nthen start this app again.";
                 return;
             }
+            String described = gameDescriptionProblem(eboot.getParentFile());
+            if (described != null) {
+                setupFailed = true;
+                setupStatus = described;
+                return;
+            }
 
             File storage = new File(getFilesDir(), "core");
             storage.mkdirs();
@@ -669,6 +794,11 @@ public class MainActivity extends Activity
                 // per render pass goes for the tiled way too often.
                 env.add("TU_DEBUG=sysmem");
             }
+            // The driver's shader compiler puts no "preamble" before the game's shaders (the
+            // part of a shader that is the same for a whole draw, worked out once at its
+            // start): this game makes about 1700 draws a frame, mostly small, and the GPU spends
+            // 0.5 ms a frame less without them (2.6%, four runs of the first level, 2026-10-11).
+            env.add("IR3_SHADER_DEBUG=nopreamble");
             // A few lines every five or ten seconds in core.log: the frame rate and where a
             // frame's time goes, how well each sound port keeps up, what the microphone hears.
             env.add("SHADPS4_FRAME_STATS=1");
@@ -679,18 +809,25 @@ public class MainActivity extends Activity
             // for every three where that is all the GPU manages.
             int displayRate = (nativeXrStatus() >> 8) & 0xff;
             if (displayRate == 0) {
-                displayRate = refreshRate > 0 ? Math.round(refreshRate) : 90;
+                displayRate = refreshRate > 0 ? Math.round(refreshRate) : 120;
             }
             env.add("SHADPS4_VR_REFRESH_RATE=" + displayRate);
             logInfo("the emulated headset refreshes " + displayRate + " times a second");
             if (resolution != null) {
                 env.add("SHADPS4_TITLE_RESOLUTION=" + resolution);
+            } else {
+                env.add("SHADPS4_VR_LARGEST_SIZE=" + largestResolution);
             }
             if (!realTime) {
                 env.add("SHADPS4_TITLE_TIMESTEP=0");
             }
             if (pace >= 2) {
                 env.add("SHADPS4_VR_PACE=" + pace);
+            } else {
+                // 30 frames a second throughout (3 refreshes at 90 Hz, 4 at 120): only the size
+                // of the picture follows what the GPU manages, so frames never come unevenly
+                // because a faster rate was tried.
+                env.add("SHADPS4_VR_STEADY_FPS=30");
             }
             if (headsetFov != null) {
                 double angle = horizontalFov(fieldOfView);
@@ -709,6 +846,22 @@ public class MainActivity extends Activity
                 // twice as many, and enlarges its scene to get even there.
                 env.add("SHADPS4_VR_SHARPEN=0.6");
             }
+            if (detail == DETAIL_LIGHTER) {
+                // Models change to their simpler forms at a third of the game's distances: a
+                // sixth of the GPU's time in a level like 3-2, hard to see from the seat. The
+                // sun's shadow maps a quarter of the size: a few percent more.
+                env.add("SHADPS4_TITLE_LOD=0.333");
+                env.add("SHADPS4_TITLE_SHADOW_MAP=1024");
+            }
+            if (foveation > 0) {
+                // The edges of each eye's scene shaded in blocks, centred on straight ahead
+                // (which the symmetric projection below makes the middle of the picture).
+                env.add("SHADPS4_VR_FOVEATION=" + foveation);
+            }
+            // Wherever the game draws its scene smaller than the picture it hands over, the
+            // middle of it is enlarged with FSR 1 (crisper edges) unless the game is to do it
+            // itself.
+            env.add("SHADPS4_TITLE_FSR=" + (upscaleFsr ? 2 : 0));
             // The game speaks the language its console is set to, if it has it (English
             // otherwise): the one the headset is set to, unless the settings name another.
             env.add("SHADPS4_CONSOLE_LANGUAGE="
@@ -742,6 +895,33 @@ public class MainActivity extends Activity
         }
     }
 
+    /**
+     * What is wrong with the game's description, sce_sys/param.sfo, or null if nothing is: the
+     * emulator stops at once without it, and a package keeps it apart from the game's files, so
+     * a game unpacked by hand can lack it, or have another of the package's entries in its place.
+     */
+    private static String gameDescriptionProblem(File folder) {
+        File description = new File(folder, "sce_sys/param.sfo");
+        String fix = "\n\nUnpack the game's package with the PC package's launcher, which adds it, "
+                + "or add it by hand as the README says (the number to give PkgTool is the one "
+                + "in the Index column of the PARAM_SFO line), then start this app again.";
+        if (!description.isFile()) {
+            return "The game in\n" + folder + "\nhas no description (sce_sys/param.sfo)." + fix;
+        }
+        byte[] head = new byte[4];
+        try (java.io.FileInputStream in = new java.io.FileInputStream(description)) {
+            if (in.read(head) == head.length && head[0] == 0 && head[1] == 'P' && head[2] == 'S'
+                    && head[3] == 'F') {
+                return null;
+            }
+        } catch (IOException e) {
+            // Unreadable here: the emulator says what it makes of it.
+            return null;
+        }
+        return "The game in\n" + folder + "\nhas a file sce_sys/param.sfo that is not the game's "
+                + "description (it does not start with PSF)." + fix;
+    }
+
     /** The game to run: games/CUSA12392 if present, otherwise the first folder with an eboot. */
     private static File findGame(File games) {
         File preferred = new File(games, "CUSA12392/eboot.bin");
@@ -765,7 +945,10 @@ public class MainActivity extends Activity
     private void refreshStatus() {
         if (choosingFov) {
             headsetFov = nativeHeadsetFov();
-            String status = "fov:" + fieldOfView + ":" + (gamepad != null) + ":"
+            String status = "fov:" + fieldOfView + ":" + detail + ":" + foveation + ":"
+                    + upscaleFsr + ":"
+                    + Math.round(refreshRate) + ":" + menuRow + ":"
+                    + (gamepad != null) + ":"
                     + ((nativeController() & CONTROLLER_OWN_HELD) != 0)
                     + ":" + Arrays.toString(headsetFov);
             if (!status.equals(shownStatus)) {
@@ -831,21 +1014,16 @@ public class MainActivity extends Activity
             }
         }
         // On a controller without a touchpad, buttons do what the game wants done on one:
-        // which ones is said over the game once it shows, and again whenever OPTIONS is
-        // pressed (the game's pause), for as long as it takes to read.
+        // which ones is said over the game whenever OPTIONS is pressed (the game's pause), for
+        // as long as it takes to read. (Not as the game starts: there it was in the way.)
         String title = "Astro VR Host";
         int controller = nativeController();
         int presses = nativeOptionsPresses();
         long clock = SystemClock.elapsedRealtime();
         boolean playing = !setupFailed && nativeCoreState() == CORE_RUNNING
                 && nativeFrameCount() > 0;
-        if (playing && (controller & CONTROLLER_GESTURE_BUTTONS) != 0) {
-            if (cardShownFor != (controller & CONTROLLER_WHICH)) {
-                cardShownFor = controller & CONTROLLER_WHICH;
-                cardUntil = clock + CARD_AT_START_MS;
-            } else if (presses != optionsSeen) {
-                cardUntil = clock + CARD_ON_PAUSE_MS;
-            }
+        if (playing && (controller & CONTROLLER_GESTURE_BUTTONS) != 0 && presses != optionsSeen) {
+            cardUntil = clock + CARD_ON_PAUSE_MS;
         }
         optionsSeen = presses;
         boolean card = playing && (controller & CONTROLLER_GESTURE_BUTTONS) != 0
@@ -876,14 +1054,14 @@ public class MainActivity extends Activity
                     + "Right stick: a finger on the touchpad\n"
                     + other + " grip held, right stick to a side: turn the view\n"
                     + "X and Y together: blow\n"
-                    + "The menu button brings this back.";
+                    + "Shown whenever the menu button is pressed.";
         }
         return "R2: press the touchpad (water, guns)\n"
                 + "R1: swipe forward (hook, stars, chests)\n"
                 + "L2: pull back, aim at the goal, let go (catapult)\n"
                 + "Right stick: a finger on the touchpad\n"
                 + "L1 held, right stick to a side: turn the view\n"
-                + "OPTIONS brings this back.";
+                + "Shown whenever OPTIONS is pressed.";
     }
 
     /** What the game and the display are doing, for the panel that stats=1 keeps in view. */
@@ -920,7 +1098,10 @@ public class MainActivity extends Activity
         return 1440 * Math.PI / 180 / (2 * renderTan);
     }
 
-    /** A popup drawn into the OpenXR panel: visible in both eyes while the core is still idle. */
+    /**
+     * A popup drawn into the OpenXR panel: visible in both eyes while the core is still idle. The
+     * host stands it still in the room, in front of where the player faced when it appeared.
+     */
     private void drawFovMenu() {
         Bitmap bitmap = Bitmap.createBitmap(STATUS_WIDTH, STATUS_HEIGHT, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
@@ -930,63 +1111,153 @@ public class MainActivity extends Activity
 
         paint.setColor(Color.rgb(90, 170, 255));
         paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        paint.setTextSize(44);
-        canvas.drawText("Choose your field of view", 48, 78, paint);
-        paint.setColor(Color.WHITE);
-        paint.setTypeface(Typeface.DEFAULT);
-        paint.setTextSize(27);
-        canvas.drawText("100% uses the full field of view of your headset.", 48, 126, paint);
-        canvas.drawText("A narrower view improves pixels per degree (PPD) and clarity.", 48, 162, paint);
+        paint.setTextSize(34);
+        canvas.drawText("Before you play", 48, 43, paint);
 
-        paint.setTextAlign(Paint.Align.CENTER);
-        paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        paint.setTextSize(40);
-        canvas.drawText(headsetFov == null ? fieldOfView + "% of your headset FOV"
+        // The line that left and right change is the one with a frame around it.
+        final float[][] rows = {{52, 172}, {176, 240}, {244, 308}, {312, 376}, {380, 444}};
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(3);
+        canvas.drawRoundRect(new RectF(24, rows[menuRow][0], 1000, rows[menuRow][1]), 18, 18,
+                paint);
+        paint.setStyle(Paint.Style.FILL);
+
+        // The field of view.
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(26);
+        canvas.drawText("Field of view", 48, 82, paint);
+        paint.setTextAlign(Paint.Align.RIGHT);
+        canvas.drawText(headsetFov == null ? fieldOfView + "% of your headset's"
                 : fieldOfView + "%  /  about " + Math.round(horizontalFov(fieldOfView))
-                        + " degrees per eye", STATUS_WIDTH / 2.0f, 226, paint);
+                        + " degrees per eye", 976, 82, paint);
+        paint.setTextAlign(Paint.Align.LEFT);
         paint.setTypeface(Typeface.DEFAULT);
-        paint.setTextSize(25);
+        paint.setTextSize(20);
         String density = "Detecting your headset's field of view...";
         if (headsetFov != null) {
             int gain = (int) Math.round((100.0 / fieldOfView - 1) * 100);
-            density = gain == 0 ? "Full headset FOV / original pixel density"
-                    : "About " + gain + "% more pixels per degree at the center than at 100%";
+            density = gain == 0 ? "All of your headset's view, at the game's own pixel density"
+                    : "A narrower view: about " + gain + "% more pixels per degree at the center";
         }
-        canvas.drawText(density, STATUS_WIDTH / 2.0f, 266, paint);
-
+        canvas.drawText(density, 48, 107, paint);
         paint.setColor(Color.rgb(48, 56, 76));
-        canvas.drawRoundRect(new RectF(120, 302, 904, 314), 6, 6, paint);
+        canvas.drawRoundRect(new RectF(120, 120, 904, 132), 6, 6, paint);
         float sliderX = 120 + (fieldOfView - FOV_MIN) * 784.0f / (FOV_MAX - FOV_MIN);
         paint.setColor(Color.rgb(90, 170, 255));
-        canvas.drawRoundRect(new RectF(120, 302, sliderX, 314), 6, 6, paint);
-        canvas.drawCircle(sliderX, 308, 13, paint);
+        canvas.drawRoundRect(new RectF(120, 120, sliderX, 132), 6, 6, paint);
+        canvas.drawCircle(sliderX, 126, 11, paint);
         paint.setColor(Color.LTGRAY);
-        paint.setTextSize(23);
-        paint.setTextAlign(Paint.Align.LEFT);
-        canvas.drawText("50%: sharper", 120, 350, paint);
+        paint.setTextSize(18);
+        canvas.drawText("50%: sharper", 120, 160, paint);
         paint.setTextAlign(Paint.Align.RIGHT);
-        canvas.drawText("100%: full headset FOV", 904, 350, paint);
+        canvas.drawText("100%: all of it", 904, 160, paint);
         paint.setTextAlign(Paint.Align.CENTER);
-        canvas.drawText(fieldOfView < 100 ? "Soft squircle border  /  Default: 85%"
-                : "No added border  /  Default: 85%", STATUS_WIDTH / 2.0f, 385, paint);
+        canvas.drawText(fieldOfView < 100 ? "Soft border  /  Default 85%"
+                : "No border  /  Default 85%", STATUS_WIDTH / 2.0f, 160, paint);
+
+        // How much is drawn further away.
+        drawMenuLine(canvas, paint, rows[1][0], "Detail further away",
+                detail == DETAIL_CONSOLE ? "As on the console" : "Lighter: faster",
+                detail == DETAIL_CONSOLE
+                        ? "Everything the PS4 version draws, at any distance: the most GPU work"
+                        : "Simpler models further away, softer shadow edges: hard to tell apart");
+
+        // How much of the edges is shaded in blocks.
+        drawMenuLine(canvas, paint, rows[2][0], "Foveated rendering",
+                FOVEATION_NAMES[foveation] + (foveation == FOVEATION_DEFAULT ? " (default)" : ""),
+                foveation == 0 ? "Every pixel shaded on its own, out to the edges of the picture"
+                        : foveation == 1 ? "The picture's outer edge shaded in blocks of 2x2 pixels"
+                        : foveation == 2 ? "The outer part of the picture shaded in 2x2 blocks"
+                        : foveation == 3 ? "Most of the edges in 2x2 blocks, the far edges in 4x4"
+                        : "All but the middle in 2x2 blocks, the outer part in 4x4");
+
+        // How the game's picture is enlarged.
+        drawMenuLine(canvas, paint, rows[3][0], "Picture enlarged with",
+                upscaleFsr ? "FSR 1 (default)" : "The game's own",
+                upscaleFsr ? "AMD FSR 1 in the middle of the view: crisper edges"
+                        : "The game's own stretch, as on the console: softer edges");
+
+        // How often the display refreshes.
+        int rate = Math.round(refreshRate);
+        drawMenuLine(canvas, paint, rows[4][0], "Display refresh rate",
+                rate + " Hz" + (rate == REFRESH_DEFAULT ? " (default)" : ""),
+                rate == REFRESH_DEFAULT
+                        ? "Each of the 30 frames shown 3 times: the most GPU time for the game"
+                        : rate == REFRESH_FASTER
+                        ? "Each frame shown 4 times: smoother head turns, less GPU time for the game"
+                        : "As vrhost.txt asks");
+
         // Whatever the player has in their hands chooses: a gamepad, or the headset's own
         // controllers.
         boolean controller = gamepad != null
                 || (nativeController() & CONTROLLER_OWN_HELD) != 0;
+        paint.setTextAlign(Paint.Align.CENTER);
+        paint.setTypeface(Typeface.DEFAULT);
         paint.setColor(controller ? Color.WHITE : Color.rgb(255, 200, 110));
-        paint.setTextSize(25);
-        canvas.drawText(controller ? "Left / Right on a stick or the D-pad: choose"
+        paint.setTextSize(21);
+        canvas.drawText(controller ? "Up / Down: choose a line    Left / Right: change it"
                 : "Pick up the controllers, or switch a gamepad on, to choose and start",
-                STATUS_WIDTH / 2.0f, 422, paint);
+                STATUS_WIDTH / 2.0f, 467, paint);
 
         paint.setColor(headsetFov != null ? Color.rgb(45, 104, 182) : Color.rgb(48, 56, 76));
-        canvas.drawRoundRect(new RectF(322, 443, 702, 495), 18, 18, paint);
+        canvas.drawRoundRect(new RectF(322, 475, 702, 509), 16, 16, paint);
         paint.setColor(Color.WHITE);
-        paint.setTextSize(28);
+        paint.setTextSize(25);
         paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
         canvas.drawText(headsetFov != null ? "X / A or trigger: Play" : "Detecting FOV...",
-                STATUS_WIDTH / 2.0f, 478, paint);
+                STATUS_WIDTH / 2.0f, 501, paint);
         publishStatusBitmap(bitmap);
+    }
+
+    /** A line of the start-up menu with a choice and what it does, from `top` down. */
+    private static void drawMenuLine(Canvas canvas, Paint paint, float top, String label,
+            String value, String description) {
+        paint.setTextAlign(Paint.Align.LEFT);
+        paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(26);
+        canvas.drawText(label, 48, top + 28, paint);
+        paint.setTextAlign(Paint.Align.RIGHT);
+        canvas.drawText("<  " + value + "  >", 976, top + 28, paint);
+        paint.setTextAlign(Paint.Align.LEFT);
+        paint.setTypeface(Typeface.DEFAULT);
+        paint.setTextSize(20);
+        canvas.drawText(description, 48, top + 54, paint);
+    }
+
+    /** Left or right in the start-up menu: changes the line chosen. */
+    private void adjustMenu(int direction) {
+        if (menuRow == 0) {
+            adjustFov(direction);
+            return;
+        }
+        // Lines of two choices take the one on the side pushed to, so that a stick held over
+        // does not flip them back and forth.
+        if (menuRow == 1) {
+            detail = direction < 0 ? DETAIL_CONSOLE : DETAIL_LIGHTER;
+        } else if (menuRow == 2) {
+            foveation = Math.max(0, Math.min(FOVEATION_MAX, foveation + direction));
+        } else if (menuRow == 3) {
+            upscaleFsr = direction > 0;
+        } else {
+            int wanted = direction < 0 || !offersRate(REFRESH_FASTER) ? REFRESH_DEFAULT
+                    : REFRESH_FASTER;
+            if (wanted != Math.round(refreshRate)) {
+                // The display switches at once: what the menu says is what it does.
+                refreshRate = wanted;
+                nativeSetRefreshRate(refreshRate);
+            }
+        }
+        drawFovMenu();
+    }
+
+    /** Up or down in the start-up menu: chooses another line. */
+    private void moveMenuRow(int direction) {
+        int row = Math.max(0, Math.min(MENU_ROWS - 1, menuRow + direction));
+        if (row != menuRow) {
+            menuRow = row;
+            drawFovMenu();
+        }
     }
 
     private void adjustFov(int direction) {
@@ -1010,8 +1281,16 @@ public class MainActivity extends Activity
             nextOwnFovMoveAt = 0;
         } else if (now >= nextOwnFovMoveAt) {
             nativeUseController(CONTROLLER_OWN);
-            adjustFov(direction);
+            adjustMenu(direction);
             nextOwnFovMoveAt = now + 250;
+        }
+        int row = (menu & MENU_UP) != 0 ? -1 : (menu & MENU_DOWN) != 0 ? 1 : 0;
+        if (row == 0) {
+            nextOwnRowMoveAt = 0;
+        } else if (now >= nextOwnRowMoveAt) {
+            nativeUseController(CONTROLLER_OWN);
+            moveMenuRow(row);
+            nextOwnRowMoveAt = now + 300;
         }
         if ((menu & MENU_CONFIRM) == 0) {
             ownConfirmArmed = true;
@@ -1159,10 +1438,16 @@ public class MainActivity extends Activity
                 }
                 switch (event.getKeyCode()) {
                     case KeyEvent.KEYCODE_DPAD_LEFT:
-                        adjustFov(-1);
+                        adjustMenu(-1);
                         break;
                     case KeyEvent.KEYCODE_DPAD_RIGHT:
-                        adjustFov(1);
+                        adjustMenu(1);
+                        break;
+                    case KeyEvent.KEYCODE_DPAD_UP:
+                        moveMenuRow(-1);
+                        break;
+                    case KeyEvent.KEYCODE_DPAD_DOWN:
+                        moveMenuRow(1);
                         break;
                     case KeyEvent.KEYCODE_BUTTON_A:
                     case KeyEvent.KEYCODE_DPAD_CENTER:
@@ -1264,16 +1549,29 @@ public class MainActivity extends Activity
                     && event.getAction() == MotionEvent.ACTION_MOVE) {
                 noteInputFrom(event.getDevice());
                 float x = axis(event, MotionEvent.AXIS_X);
+                float y = axis(event, MotionEvent.AXIS_Y);
                 float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X);
-                int direction = x < -0.55f || hatX < -0.5f ? -1
-                        : x > 0.55f || hatX > 0.5f ? 1 : 0;
+                float hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
+                // The way the stick is pushed most is the one that counts.
+                boolean sideways = Math.abs(x) >= Math.abs(y);
+                int direction = hatX < -0.5f || (sideways && x < -0.55f) ? -1
+                        : hatX > 0.5f || (sideways && x > 0.55f) ? 1 : 0;
+                int row = hatY < -0.5f || (!sideways && y < -0.55f) ? -1
+                        : hatY > 0.5f || (!sideways && y > 0.55f) ? 1 : 0;
                 long now = SystemClock.uptimeMillis();
                 if (direction == 0) {
                     nextFovMoveAt = 0;
                 } else if (now >= nextFovMoveAt) {
                     nativeUseController(CONTROLLER_GAMEPAD);
-                    adjustFov(direction);
+                    adjustMenu(direction);
                     nextFovMoveAt = now + 250;
+                }
+                if (row == 0) {
+                    nextRowMoveAt = 0;
+                } else if (now >= nextRowMoveAt) {
+                    nativeUseController(CONTROLLER_GAMEPAD);
+                    moveMenuRow(row);
+                    nextRowMoveAt = now + 300;
                 }
             }
             return true;

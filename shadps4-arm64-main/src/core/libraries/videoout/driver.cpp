@@ -22,6 +22,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_gpu_profile.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -464,6 +465,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
                  "BACHATA_FLIP_TRACE stage=prepare_done index={} arg={} frame={}", index, flip_arg,
                  static_cast<const void*>(frame));
     }
+    Vulkan::GpuProfile::NoteFrameDone();
 
     std::scoped_lock lock{mutex};
     requests.push({
@@ -527,15 +529,19 @@ void VideoOutDriver::SubmitHmdFrameInternal(VideoOutPort* port, const HmdFrame& 
     }
     Vulkan::FrameStats::Time(Vulkan::FrameStats::Stage::CatchUp,
                              std::chrono::steady_clock::now() - handed_over);
+    Vulkan::GpuProfile::NoteFrameDone();
+    Vulkan::FrameStats::NoteHmdFrame();
 
-    if (Vulkan::FrameStats::Enabled()) {
+    {
         // This runs on the GPU thread, once per frame: what it has used of the processor
-        // since the last time is what the frame cost it.
+        // since the last time is what the frame cost it. (The choice of how many refreshes a
+        // frame is given goes by it too.)
         static std::chrono::nanoseconds last_thread_time{};
         const auto thread_time = Vulkan::FrameStats::ThreadTime();
         if (last_thread_time.count() != 0) {
             Vulkan::FrameStats::Time(Vulkan::FrameStats::Stage::Translate,
                                      thread_time - last_thread_time);
+            Vulkan::FrameStats::NoteGpuThreadFrame(thread_time - last_thread_time);
         }
         last_thread_time = thread_time;
     }

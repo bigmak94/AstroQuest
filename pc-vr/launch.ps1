@@ -68,11 +68,16 @@ function Save-Setting([string]$key, [string]$value) {
 }
 Read-Settings
 
-# The sizes an eye can be drawn at: the console's largest (1440x1536, what a PlayStation 4 Pro
-# draws) and larger, all the same shape.
-$widths = @(1440, 1800, 2160, 2520, 2880, 3240, 3600)
-function EyeHeight([int]$width) { return [int]([math]::Round(1536.0 * $width / 1440 / 8) * 8) }
-$caps = @(120, 90, 72, 60, 45, 40, 36, 30)
+# The sizes an eye can be drawn at: the console's smaller ones (for a headset with fewer pixels,
+# a Rift S or a Rift), its largest (1440x1536, what a PlayStation 4 Pro draws) and larger ones
+# of that shape.
+$widths = @(816, 960, 1200, 1440, 1800, 2160, 2520, 2880, 3240, 3600)
+$consoleHeights = @{ 816 = 870; 960 = 1080; 1200 = 1280 }
+function EyeHeight([int]$width) {
+    if ($consoleHeights.ContainsKey($width)) { return $consoleHeights[$width] }
+    return [int]([math]::Round(1536.0 * $width / 1440 / 8) * 8)
+}
+$caps = @(120, 90, 80, 72, 60, 45, 40, 36, 30)
 # The languages the game has, as Windows names them.
 $gameLanguages = @("en-US", "en-GB", "fr-FR", "fr-CA", "es-ES", "es-419", "de-DE", "it-IT", "nl-NL",
                    "pt-PT", "pt-BR", "ru-RU", "pl-PL", "tr-TR", "sv-SE", "nb-NO", "da-DK", "fi-FI",
@@ -177,7 +182,12 @@ $madeFor = "CUSA12392"
 # is longer than 259 characters.
 $longestInside = 126
 $zeroPasscode = "0" * 32
-$unpackFolder = ".unpacking"
+# Where a package is unpacked before its game is moved into place: a folder in the games folder
+# with a name so short that no file has a longer path there than in the game's own folder
+# (games\.u\uroot\... against games\CUSA12392\...). Inside the game's folder, as before, paths
+# were 24 characters longer, and PkgTool stopped partway through a game whose folder passed the
+# check. Neither name is looked into for a game.
+$unpackFolders = @(".u", ".unpacking")
 
 function Gigabytes([double]$bytes) { return ("{0:N1} GB" -f ($bytes / 1073741824.0)) }
 
@@ -194,7 +204,7 @@ function Get-Folders([string]$top, [int]$depth = 3) {
             if ([System.IO.File]::Exists([System.IO.Path]::Combine($folder, "eboot.bin"))) { continue }
             try {
                 foreach ($sub in [System.IO.Directory]::GetDirectories($folder)) {
-                    if ([System.IO.Path]::GetFileName($sub) -ne $unpackFolder) { $next += $sub }
+                    if ($unpackFolders -notcontains [System.IO.Path]::GetFileName($sub)) { $next += $sub }
                 }
             } catch {}
         }
@@ -389,7 +399,8 @@ function Expand-Package($package) {
     $serial = "game"
     if ($contentId -match "[A-Z]{4}[0-9]{5}") { $serial = $Matches[0] }
     $target = Join-Path $gamesFolder $serial
-    if ($target.Length + 1 + $longestInside -gt 259) {
+    $work = Join-Path $gamesFolder $unpackFolders[0]
+    if ([math]::Max($target.Length, (Join-Path $work "uroot").Length) + 1 + $longestInside -gt 259) {
         [void](Show-Box ("The game cannot be unpacked into`n" + $target + "`n`nThat path is too long: some of the game's files would have a path of more than 259 characters, which the emulator cannot open. Move the AstroQuest folder somewhere with a shorter path, for example C:\Games\AstroQuest, and start again.") "OK" "Warning")
         return $null
     }
@@ -406,37 +417,48 @@ function Expand-Package($package) {
     if ($answer -ne "Yes") { return $null }
 
     # Unpacked into a folder of its own first: what is left of an unpacking that did not finish
-    # is never taken for the game.
-    $work = Join-Path $target $unpackFolder
+    # is never taken for the game. (What PkgTool says goes to the temporary folder, so that
+    # nothing but the game is in there.)
     try {
         if ([System.IO.Directory]::Exists($work)) { [System.IO.Directory]::Delete($work, $true) }
         [void][System.IO.Directory]::CreateDirectory($work)
     } catch {
-        [void](Show-Box ("Could not write to`n" + $target + "`n`n" + $_.Exception.Message) "OK" "Warning")
+        [void](Show-Box ("Could not write to`n" + $gamesFolder + "`n`n" + $_.Exception.Message) "OK" "Warning")
         return $null
     }
-    $errors = Join-Path $work "pkgtool-errors.txt"
-    $arguments = "pkg_extract --passcode " + $zeroPasscode + " `"" + $package.FullName + "`" `"" + (Join-Path $work "files") + "`""
+    $errors = Join-Path ([System.IO.Path]::GetTempPath()) "AstroQuest-pkgtool-errors.txt"
+    $arguments = "pkg_extract --passcode " + $zeroPasscode + " `"" + $package.FullName + "`" `"" + $work + "`""
     Say ("Unpacking " + $package.FullName)
     $process = Start-Process -FilePath $tool -ArgumentList $arguments -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $work "pkgtool-output.txt") -RedirectStandardError $errors
+        -RedirectStandardOutput (Join-Path ([System.IO.Path]::GetTempPath()) "AstroQuest-pkgtool-output.txt") `
+        -RedirectStandardError $errors
     # (Without this the exit code is not to be had later.)
     $null = $process.Handle
     $finished = Show-Unpacking $process $drive $free
 
-    $unpacked = Join-Path $work "files\uroot"
-    if (-not [System.IO.Directory]::Exists($unpacked)) { $unpacked = Join-Path $work "files" }
+    $unpacked = Join-Path $work "uroot"
+    if (-not [System.IO.Directory]::Exists($unpacked)) { $unpacked = $work }
     $failure = $null
     if (-not $finished) {
         $failure = "cancelled"
     } elseif ($process.ExitCode -ne 0 -or -not [System.IO.File]::Exists((Join-Path $unpacked "eboot.bin"))) {
         $why = ""
         try { $why = (@(Get-Content -LiteralPath $errors -ErrorAction Stop | Where-Object { $_.Trim() -ne "" })[0]) } catch {}
-        $failure = "The package could not be unpacked.`n`nOnly a package made from a dump of the game can be: it is not encrypted. A package from the PlayStation Store is, and cannot be used.`n`n" + $package.FullName
+        if ($why -match "PathTooLong") {
+            $failure = "The package could not be unpacked into`n" + $target + "`n`nThat path is too long: some of the game's files would have a path of more than 259 characters. Move the AstroQuest folder somewhere with a shorter path, for example C:\Games\AstroQuest, and start again."
+        } elseif ($why -match "IOException|UnauthorizedAccess") {
+            $failure = "The package could not be unpacked: writing to`n" + $gamesFolder + "`nfailed. Is the drive full, or does a security program keep the folder from being written to?`n`n" + $package.FullName
+        } else {
+            $failure = "The package could not be unpacked.`n`nOnly a package made from a dump of the game can be: it is not encrypted. A package from the PlayStation Store is, and cannot be used.`n`n" + $package.FullName
+        }
         if ($why) { $failure += "`n`n(PkgTool: " + $why.Trim() + ")" }
     } else {
         try {
-            # Into place: over anything of the same name that an earlier attempt left there.
+            # Into place: over anything of the same name that an earlier attempt left there
+            # (with what an unpacking of an earlier version left inside the game's folder).
+            [void][System.IO.Directory]::CreateDirectory($target)
+            $leftBefore = Join-Path $target $unpackFolders[1]
+            if ([System.IO.Directory]::Exists($leftBefore)) { [System.IO.Directory]::Delete($leftBefore, $true) }
             foreach ($item in [System.IO.Directory]::GetFileSystemEntries($unpacked)) {
                 $to = Join-Path $target ([System.IO.Path]::GetFileName($item))
                 if ([System.IO.Directory]::Exists($to)) { [System.IO.Directory]::Delete($to, $true) }
@@ -671,14 +693,16 @@ function Show-Menu {
     $form.Controls.Add($label)
     $y += 22
     $resolution = New-Object System.Windows.Forms.TrackBar
+    $resolution.Name = "resolution"
     $resolution.Minimum = 0
     $resolution.Maximum = $widths.Count - 1
     $resolution.TickFrequency = 1
     $resolution.LargeChange = 1
     $resolution.SetBounds(12, $y, 530, 40)
-    $current = [int](Setting "resolution" "2880")
+    $current = 0
+    [void][int]::TryParse((Setting "resolution" "2880"), [ref]$current)
     $index = [array]::IndexOf($widths, $current)
-    if ($index -lt 0) { $index = 4 }
+    if ($index -lt 0) { $index = [array]::IndexOf($widths, 2880) }
     $resolution.Value = $index
     $form.Controls.Add($resolution)
     $y += 42
@@ -689,8 +713,12 @@ function Show-Menu {
         $w = $widths[$resolution.Value]
         $h = EyeHeight $w
         $times = ($w * $h) / (1440.0 * 1536.0)
-        $what = if ($w -eq 1440) { "the console's own, as a PlayStation 4 Pro draws it" } else { "{0:N2} times the pixels of the console" -f $times }
-        $resolutionText.Text = "$w x $h pixels an eye: $what. The game draws smaller by itself when the graphics card cannot keep up."
+        if ($w -lt 1440) {
+            $resolutionText.Text = "$w x $h pixels an eye: one of the console's smaller sizes, for a headset with fewer pixels (a Rift S has 1280 x 1440 an eye). The game keeps to it."
+        } else {
+            $what = if ($w -eq 1440) { "the console's own, as a PlayStation 4 Pro draws it" } else { "{0:N2} times the pixels of the console" -f $times }
+            $resolutionText.Text = "$w x $h pixels an eye: $what. The game draws smaller by itself when the graphics card cannot keep up."
+        }
     }
     $resolution.Add_ValueChanged($update)
     & $update
@@ -720,6 +748,7 @@ function Show-Menu {
     $language.SetBounds(284, $y, 260, 26)
     $form.Controls.Add($language)
     $fps = New-Object System.Windows.Forms.ComboBox
+    $fps.Name = "fps"
     $fps.DropDownStyle = "DropDownList"
     foreach ($cap in $caps) {
         $text = "$cap"
@@ -727,8 +756,10 @@ function Show-Menu {
         [void]$fps.Items.Add($text)
     }
     $fps.SetBounds(16, $y, 200, 26)
-    $index = [array]::IndexOf($caps, [int](Setting "fps" "60"))
-    if ($index -lt 0) { $index = 3 }
+    $current = 0
+    [void][int]::TryParse((Setting "fps" "60"), [ref]$current)
+    $index = [array]::IndexOf($caps, $current)
+    if ($index -lt 0) { $index = [array]::IndexOf($caps, 60) }
     $fps.SelectedIndex = $index
     $form.Controls.Add($fps)
     $y += 32

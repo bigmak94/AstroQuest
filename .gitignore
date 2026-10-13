@@ -42,3 +42,4 @@ eboot.bin
 sce_sys/
 sce_module/
 savedata/
+/tools/*.zip

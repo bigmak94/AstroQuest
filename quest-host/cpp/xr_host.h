@@ -12,8 +12,10 @@
 class CoreProcess;
 class PadRouter;
 
-/// A picture the Java side draws (text is far easier there) and the headset shows on a floating
-/// panel whenever the game itself has nothing on screen.
+/// A picture the Java side draws (text is far easier there) and the headset shows on a panel
+/// whenever the game itself has nothing on screen: one that stands still in the room before the
+/// game's first picture (the start-up menu and what follows it), one that follows the head over
+/// the game (the game stopped drawing, the controls card, stats=1).
 struct StatusImage {
     static constexpr int Width = 1024;
     static constexpr int Height = 512;
@@ -24,7 +26,8 @@ struct StatusImage {
 };
 
 struct XrHostOptions {
-    /// Display refresh rate to ask for, 0 keeps the system default.
+    /// Display refresh rate to ask for; 0, or one the display refuses: the host's own order (90,
+    /// 120, 80, 72 Hz).
     float refresh_rate{0.0f};
     /// Size of one eye in the buffers frames are delivered in.
     uint32_t eye_width{1440};
@@ -96,6 +99,11 @@ struct XrHostStatus {
     /// The panel is to be shown over the game: it has something to say to who is playing.
     std::atomic<bool> show_panel{};
     std::atomic<float> refresh_rate{};
+    /// A display refresh rate the startup menu asks to switch to now, 0 when nothing is asked.
+    std::atomic<float> wanted_refresh_rate{};
+    /// The refresh rates the display offers: bit 0 72 Hz, bit 1 80, bit 2 90, bit 3 120 (0 until
+    /// the session has said).
+    std::atomic<uint32_t> offered_rates{};
     /// Set when the startup choice is confirmed, before the game can deliver any frames.
     std::atomic<bool> reduced_fov{};
     /// Full projection tangents reported by this headset: out, in, up, down.

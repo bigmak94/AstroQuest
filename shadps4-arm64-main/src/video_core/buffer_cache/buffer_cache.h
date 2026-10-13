@@ -132,6 +132,11 @@ public:
                                                        bool is_texel_buffer = false,
                                                        BufferId buffer_id = {});
 
+    /// Obtains a read-only buffer to be bound as a uniform buffer: at an offset a uniform
+    /// buffer may start at, with the rest of its last 16-byte row reading as zero.
+    [[nodiscard]] std::pair<Buffer*, u32> ObtainUniformBuffer(VAddr gpu_addr, u32 size,
+                                                              BufferId buffer_id = {});
+
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
 

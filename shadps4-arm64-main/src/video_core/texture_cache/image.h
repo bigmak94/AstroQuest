@@ -201,6 +201,9 @@ public:
         std::vector<State> subresource_states;
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
+        /// The view last asked for (FindView), most of the time the one asked for next.
+        ImageViewInfo last_view_info{};
+        ImageViewId last_view_id{};
         /// Requests for part of the image that found, or left, that part in the state asked
         /// for. They stay true until some state changes (`state_version` counts those): a
         /// draw asks for the same thing as the one before it far more often than not, and

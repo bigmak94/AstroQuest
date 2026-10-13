@@ -3,16 +3,20 @@
 
 #include "common/debug.h"
 #include "core/emulator_settings.h"
+#include "core/known_title.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "common/alignment.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/readconst_snapshot_diag.h"
+#include "video_core/renderer_vulkan/vk_foveation.h"
+#include "video_core/renderer_vulkan/vk_gpu_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/vk_title_upscale.h"
 
 #include <array>
 #include <bit>
@@ -49,6 +53,20 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    if (GpuProfile::Enabled()) {
+        gpu_profile = std::make_unique<GpuProfile>(instance, scheduler);
+    }
+    if (Foveation::Level() > 0) {
+        foveation = std::make_unique<Foveation>(instance, scheduler);
+    }
+}
+
+bool Rasterizer::EyesUpscaled() const {
+    return eyes_upscaled;
+}
+
+float Rasterizer::UpscaledRadius() const {
+    return TitleUpscale::FineRadius(instance);
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -57,6 +75,10 @@ static std::atomic<s32> g_draw_trace_budget{0};
 
 void Rasterizer::StartDrawTrace(s32 count) {
     g_draw_trace_budget.store(count);
+}
+
+bool Rasterizer::DrawTraceActive() {
+    return g_draw_trace_budget.load(std::memory_order_relaxed) > 0;
 }
 
 static bool TraceDraw() {
@@ -257,8 +279,34 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+void Rasterizer::ChooseUniformBuffers(bool graphics) const {
+    // The read-only guest buffers of draws that are small enough to be copied for every draw
+    // anyway (BufferCache::ObtainBuffer) are uniform buffers: with the headset's driver
+    // (Turnip), where that took 13% off the GPU's time for a frame of 3-2 (2026-10-09), or
+    // wherever SHADPS4_UBO=1 asks for it; SHADPS4_UBO=0 keeps storage buffers. Under the A/B
+    // measuring aid as "ubo". (Not with the pipeline cache on disk: its pipelines are made
+    // before any draw says which kind a buffer is.)
+    static const u32 limit = [this] {
+        const char* value = std::getenv("SHADPS4_UBO");
+        const bool wanted = value != nullptr ? value[0] == '1'
+                                             : instance.GetDriverID() == vk::DriverId::eMesaTurnip;
+        if (!wanted || EmulatorSettings.IsPipelineCacheEnabled()) {
+            return 0u;
+        }
+        const u64 largest = instance.UniformMaxSize() - instance.UniformMinAlignment();
+        const u32 chosen = static_cast<u32>(std::min<u64>(largest, 16_KB));
+        LOG_INFO(Render_Vulkan,
+                 "Read-only buffers of draws up to {} bytes are uniform buffers in the shaders",
+                 chosen);
+        return chosen;
+    }();
+    Shader::uniform_buffer_limit.store(graphics && !FrameStats::AbOff("ubo") ? limit : 0,
+                                       std::memory_order_relaxed);
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    ChooseUniformBuffers(true);
 
     scheduler.PopPendingOperations();
     if (scheduler.IsFlushDue()) {
@@ -347,6 +395,22 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     PrepareRenderState(pipeline);
+    // A draw that writes nothing changes nothing: the console's GPU only counts what such a
+    // draw would let through, for occlusion queries, and those counts are made up here anyway.
+    // (Astro Bot has 45 of them in each eye's depth pass.) SHADPS4_SKIP_EMPTY_DRAWS=0 keeps
+    // them; under the A/B measuring aid as "skipempty".
+    static const bool skip_empty = [] {
+        const char* value = std::getenv("SHADPS4_SKIP_EMPTY_DRAWS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (skip_empty && !FrameStats::AbOff("skipempty") && DrawsNothing(pipeline)) {
+        FrameStats::Add(FrameStats::Counter::EmptyDraws);
+        if (trace) {
+            LOG_INFO(Render_Vulkan, "TRACE   draw left out: it writes nothing");
+        }
+        ResetBindings();
+        return;
+    }
     if (!BindResources(pipeline)) {
         if (trace) {
             LOG_INFO(Render_Vulkan, "TRACE   draw dropped: resources could not be bound");
@@ -354,6 +418,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     const auto state = BeginRendering(pipeline);
+    if (SkipSecondEye(state)) {
+        ResetBindings();
+        RetireIsolatedReadConstSnapshots();
+        return;
+    }
 
     buffer_cache.BindVertexBuffers(*pipeline);
     if (is_indexed) {
@@ -379,20 +448,153 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         const char* value = std::getenv("SHADPS4_DBG_DRAW_VERTICES");
         return value != nullptr && value[0] != 0 ? static_cast<u32>(std::atoi(value)) : ~0u;
     }();
-    const u32 num_vertices = std::min<u32>(regs.num_indices, vertex_limit);
-    FrameStats::Add(FrameStats::Counter::Vertices,
-                    u64{num_vertices} * regs.num_instances.NumInstances());
+    // (Under the A/B measuring aid as "onetri": cut down only while it is made.)
+    const u32 num_vertices =
+        std::min<u32>({regs.num_indices, FrameStats::AbOff("onetri") ? ~0u : vertex_limit,
+                       thin_second_eye_draw ? 3u : ~0u});
+    // (A second eye's draw cut down to one triangle is drawn once, not for every instance.)
+    const u32 num_instances = thin_second_eye_draw ? 1u : regs.num_instances.NumInstances();
+    FrameStats::Add(FrameStats::Counter::Vertices, u64{num_vertices} * num_instances);
 
-    if (is_indexed) {
-        cmdbuf.drawIndexed(num_vertices, regs.num_instances.NumInstances(), 0,
-                           s32(vertex_offset), instance_offset);
-    } else {
-        cmdbuf.draw(num_vertices, regs.num_instances.NumInstances(), vertex_offset,
-                    instance_offset);
+    const bool timed = gpu_profile && gpu_profile->Before(ProfileWork(pipeline),
+                                                          u64{num_vertices} * num_instances);
+    {
+        const FrameStats::CallTimer timer{FrameStats::Call::Draw};
+        if (is_indexed) {
+            cmdbuf.drawIndexed(num_vertices, num_instances, 0, s32(vertex_offset),
+                               instance_offset);
+        } else {
+            cmdbuf.draw(num_vertices, num_instances, vertex_offset, instance_offset);
+        }
+    }
+    if (timed) {
+        gpu_profile->After();
     }
 
     ResetBindings();
     RetireIsolatedReadConstSnapshots();
+}
+
+bool Rasterizer::DrawsNothing(const GraphicsPipeline* pipeline) const {
+    const auto& regs = liverpool->regs;
+    const auto& key = pipeline->GetGraphicsKey();
+    // Colour: a target bound and something of it written. (Draws that eliminate fast clears or
+    // resolve are not ordinary draws.)
+    const auto mode = regs.color_control.mode;
+    if (mode != AmdGpu::ColorControl::OperationMode::Normal &&
+        mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        return false;
+    }
+    for (u32 cb = 0; cb < key.num_color_attachments; ++cb) {
+        if (cb_descs[cb].first && key.write_masks[cb]) {
+            return false;
+        }
+    }
+    // Depth and stencil: written, or cleared by the draw.
+    if (regs.depth_render_control.depth_clear_enable ||
+        regs.depth_render_control.stencil_clear_enable || regs.depth_render_control.depth_copy ||
+        regs.depth_render_control.stencil_copy) {
+        return false;
+    }
+    if (db_desc.first) {
+        if (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable) {
+            return false;
+        }
+        if (regs.depth_control.stencil_enable) {
+            return false;
+        }
+    }
+    // Memory: stream output, or a shader that stores.
+    if (regs.vgt_strmout_config.raw != 0) {
+        return false;
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage == nullptr) {
+            continue;
+        }
+        if (stage->has_storage_images || stage->uses_dma) {
+            return false;
+        }
+        for (const auto& buffer : stage->buffers) {
+            if (buffer.is_written) {
+                return false;
+            }
+        }
+        for (const auto& image : stage->images) {
+            if (image.is_written || image.is_atomic) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool Rasterizer::SkipSecondEye(const RenderState& state) {
+    // SHADPS4_DBG_SKIP_SECOND_EYE=1: a measuring aid. A frame's scene draws for the second eye
+    // (those after the first eye's picture is drawn) are left out, so that eye shows what the
+    // first one saw: what drawing the second eye costs, which is as much as drawing both eyes
+    // at once could save. =2 draws them with one triangle each instead: what is left of the
+    // second eye then is what its draws cost as such, which drawing both eyes at once saves,
+    // apart from the vertices it shares.
+    static const int mode = [] {
+        const char* value = std::getenv("SHADPS4_DBG_SKIP_SECOND_EYE");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    // SHADPS4_DBG_STEREO_TIMING=1: every ten seconds, how long after the first eye's first
+    // scene draw the second eye's first one reaches this thread, and the first eye's picture
+    // in between: what drawing both eyes at once would hold the first eye back by.
+    static const bool timing = [] {
+        const char* value = std::getenv("SHADPS4_DBG_STEREO_TIMING");
+        return value != nullptr && value[0] == '1';
+    }();
+    thin_second_eye_draw = false;
+    if (mode != 1 && mode != 2 && !timing) {
+        return false;
+    }
+    using Clock = std::chrono::steady_clock;
+    const auto since = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    const u32 frame = FrameStats::HmdFrames();
+    if (frame != eye_frame) {
+        eye_frame = frame;
+        eye_output_seen = false;
+        eye_timing = {};
+    }
+    const bool scene = Core::KnownTitle::IsSceneSize(state.width, state.height);
+    if (state.num_color_attachments != 0 && Core::KnownTitle::IsEyeSize(state.width, state.height)) {
+        if (timing && !eye_output_seen && eye_timing.first_scene != Clock::time_point{}) {
+            eye_timing.first_picture = Clock::now();
+        }
+        eye_output_seen = true;
+        return false;
+    }
+    if (timing && scene) {
+        const auto now = Clock::now();
+        if (!eye_output_seen && eye_timing.first_scene == Clock::time_point{}) {
+            eye_timing.first_scene = now;
+        } else if (eye_output_seen && eye_timing.first_picture != Clock::time_point{} &&
+                   !eye_timing.counted) {
+            eye_timing.counted = true;
+            stereo_timing.to_picture += since(eye_timing.first_scene, eye_timing.first_picture);
+            stereo_timing.to_second += since(eye_timing.first_scene, now);
+            stereo_timing.worst_second =
+                std::max(stereo_timing.worst_second, since(eye_timing.first_scene, now));
+            ++stereo_timing.frames;
+        }
+        if (now - stereo_timing.reported > std::chrono::seconds{10} && stereo_timing.frames != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Stereo timing: the second eye's first scene draw came {:.1f} ms after the "
+                     "first eye's ({:.1f} at worst), its picture done {:.1f} ms after it, over "
+                     "{} frames",
+                     stereo_timing.to_second / stereo_timing.frames, stereo_timing.worst_second,
+                     stereo_timing.to_picture / stereo_timing.frames, stereo_timing.frames);
+            stereo_timing = {.reported = now};
+        }
+    }
+    const bool second_eye = eye_output_seen && scene && !FrameStats::AbOff("eye2");
+    thin_second_eye_draw = second_eye && mode == 2;
+    return second_eye && mode == 1;
 }
 
 boost::container::small_vector<u8, 4> Rasterizer::SharedTargetPasses(u8 mrt_mask) const {
@@ -476,9 +678,41 @@ boost::container::small_vector<u8, 4> Rasterizer::SharedTargetPasses(u8 mrt_mask
     return passes;
 }
 
+GpuProfile::Work Rasterizer::ProfileWork(const Pipeline* pipeline) const {
+    GpuProfile::Work work;
+    const auto stage_hash = [&](Shader::LogicalStage stage) -> u64 {
+        const auto stages = pipeline->GetStages();
+        const u32 index = pipeline->IsCompute() ? 0 : static_cast<u32>(stage);
+        return index < stages.size() && stages[index] != nullptr ? stages[index]->pgm_hash : 0;
+    };
+    if (pipeline->IsCompute()) {
+        work.compute = true;
+        work.vs = stage_hash(Shader::LogicalStage::Compute);
+        return work;
+    }
+    work.vs = stage_hash(Shader::LogicalStage::Vertex);
+    work.ps = stage_hash(Shader::LogicalStage::Fragment);
+    const auto& state = scheduler.GetRenderState();
+    work.width = state.width;
+    work.height = state.height;
+    work.colors = static_cast<u8>(state.num_color_attachments);
+    work.depth = state.depth_stencil_attachment.has_depth ||
+                 state.depth_stencil_attachment.has_stencil;
+    const auto& regs = liverpool->regs;
+    if (const auto& cb = regs.color_buffers[0]; cb && work.colors != 0) {
+        work.format =
+            static_cast<u32>(cb.GetDataFmt()) << 8 | static_cast<u32>(cb.GetNumberFmt());
+        work.target = cb.Address();
+    } else if (work.depth) {
+        work.target = regs.depth_buffer.DepthAddress();
+    }
+    return work;
+}
+
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address) {
     RENDERER_TRACE;
+    ChooseUniformBuffers(true);
 
     scheduler.PopPendingOperations();
     if (scheduler.IsFlushDue()) {
@@ -526,6 +760,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.BindGraphicsPipeline(pipeline->Handle());
 
+    const bool timed = gpu_profile && gpu_profile->Before(ProfileWork(pipeline), 0);
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
@@ -545,6 +780,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
     }
+    if (timed) {
+        gpu_profile->After();
+    }
 
     ResetBindings();
     RetireIsolatedReadConstSnapshots();
@@ -552,6 +790,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    ChooseUniformBuffers(false);
 
     scheduler.PopPendingOperations();
     if (scheduler.IsFlushDue()) {
@@ -590,13 +829,18 @@ void Rasterizer::DispatchDirect() {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    const bool timed = gpu_profile && gpu_profile->Before(ProfileWork(pipeline), 0);
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (timed) {
+        gpu_profile->After();
+    }
 
     ResetBindings();
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    ChooseUniformBuffers(false);
 
     scheduler.PopPendingOperations();
     if (scheduler.IsFlushDue()) {
@@ -620,7 +864,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    const bool timed = gpu_profile && gpu_profile->Before(ProfileWork(pipeline), 0);
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    if (timed) {
+        gpu_profile->After();
+    }
 
     ResetBindings();
 }
@@ -939,8 +1187,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(null_buffer.Handle(), 0, VK_WHOLE_SIZE);
             }
         } else {
-            const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
-                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
+            // (A uniform buffer starts where the GPU allows one to: the shaders add no offset
+            // to what they read of it.)
+            const auto [vk_buffer, offset] =
+                is_storage ? buffer_cache.ObtainBuffer(vsharp.base_address, size, desc.is_written,
+                                                       desc.is_formatted, buffer_id)
+                           : buffer_cache.ObtainUniformBuffer(vsharp.base_address, size, buffer_id);
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
             const u32 adjust = offset - offset_aligned;
             ASSERT(adjust % 4 == 0);
@@ -1060,20 +1312,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(stage);
 
+        ASSERT(mip_fallback_mode != Shader::MipStorageFallbackMode::ConstantIndex ||
+               num_bindings == 1);
         for (auto i = 0; i < num_bindings; i++) {
-            auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
-
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
-            }
-
-            image_id = texture_cache.FindImage(desc);
+            auto& [image_id, desc] = image_bindings.emplace_back();
+            image_id = texture_cache.FindTextureImage(tsharp, image_desc, i, desc);
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -1199,6 +1442,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
+            if (!is_storage && stage.stage == Shader::Stage::Fragment &&
+                Core::KnownTitle::IsSceneEnlargement(stage.pgm_hash)) {
+                NoteFinalPass(image);
+            }
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
         }
@@ -1252,6 +1499,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    // A pass that draws to eight bits a channel draws a picture as it is to be shown, not the
+    // scene it is made from (Foveation).
+    bool display_target = false;
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -1299,6 +1549,11 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.image_layout = image->backing->state.layout;
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
+        const auto format = image->info.pixel_format;
+        display_target |= format == vk::Format::eR8G8B8A8Unorm ||
+                          format == vk::Format::eR8G8B8A8Srgb ||
+                          format == vk::Format::eB8G8R8A8Unorm ||
+                          format == vk::Format::eB8G8R8A8Srgb;
 
         image->usage.render_target = 1u;
     }
@@ -1351,7 +1606,44 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.num_layers = 1;
     }
 
+    // The passes that draw the title's scene for an eye (at the size it draws that at) are
+    // shaded more coarsely towards their edges, where it is asked for.
+    if (foveation && state.num_layers == 1 && !display_target &&
+        Core::KnownTitle::IsSceneSize(state.width, state.height)) {
+        state.shading_rate_view = foveation->MapFor(state.width, state.height);
+    }
+
     return state;
+}
+
+void Rasterizer::NoteFinalPass(const VideoCore::Image& scene) {
+    // The pass draws into the eye's picture; the shader decides by the same sizes.
+    const auto& [target_id, target_desc] = cb_descs[0];
+    if (!target_id) {
+        eyes_upscaled = false;
+        return;
+    }
+    const auto& target = texture_cache.GetImage(target_id);
+    const u32 width = scene.info.size.width;
+    const u32 height = scene.info.size.height;
+    const bool upscaled = TitleUpscale::Enlarges(width, height, target.info.size.width,
+                                                 target.info.size.height);
+    // Each way it goes, for the log, the first few times.
+    static u32 last_seen = 0;
+    static u32 changes_logged = 0;
+    const bool for_tv = TitleUpscale::ForTv(width, height);
+    const u32 seen = (width << 17) ^ (height << 2) ^ (upscaled ? 1u : 0u);
+    if (seen != last_seen && changes_logged < 16) {
+        last_seen = seen;
+        ++changes_logged;
+        LOG_INFO(Render_Vulkan, "Title upscale: the final pass enlarges {}x{} to {}x{} {}{}", width,
+                 height, target.info.size.width, target.info.size.height,
+                 upscaled ? "with FSR 1" : "bilinearly", for_tv ? " (the TV's picture)" : "");
+    }
+    // The TV's picture, made by the same pass in the same frames, says nothing about the eyes'.
+    if (!for_tv) {
+        eyes_upscaled = upscaled;
+    }
 }
 
 void Rasterizer::Resolve() {
@@ -1370,6 +1662,7 @@ void Rasterizer::Resolve() {
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
+    GpuProfile::Note(GpuProfile::HostWork::ImageCopy);
     auto& regs = liverpool->regs;
 
     auto read_desc = VideoCore::TextureCache::ImageDesc(
@@ -1546,6 +1839,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateColorBlendingState(pipeline);
 
     auto& dynamic_state = scheduler.GetDynamicState();
+    const FrameStats::CallTimer timer{FrameStats::Call::DynamicState};
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
 }
 

@@ -136,7 +136,7 @@ private:
     Frame* GetRenderFrame();
 
     /// Writes a thumbnail of every image the guest GPU rendered into to <UserDir>/rt_dump.
-    void DumpGpuImages();
+    void DumpGpuImages(std::string_view folder = "rt_dump");
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "video_core/renderer_vulkan/vk_foveation.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -34,6 +35,9 @@ BlitHelper::~BlitHelper() {
     device.destroy(src_msaa_copy_frag);
     device.destroy(src_non_msaa_copy_frag);
     device.destroy(resolve_aa_frag);
+    if (resolve_aa_fine_frag) {
+        device.destroy(resolve_aa_fine_frag);
+    }
 }
 
 void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, vk::SampleCountFlagBits samples,
@@ -259,7 +263,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, vk::SampleCountFlagB
 
 void BlitHelper::SmoothInto(u32 width, u32 height, vk::Format src_pixel_format,
                             vk::Format dst_pixel_format, vk::Image source, u32 src_layer,
-                            vk::Image dest, u32 dst_layer) {
+                            vk::Image dest, u32 dst_layer, bool fine_only) {
     const auto device = instance.GetDevice();
     const vk::ImageViewUsageCreateInfo src_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
     const vk::ImageViewCreateInfo src_view_ci = {
@@ -338,7 +342,8 @@ void BlitHelper::SmoothInto(u32 width, u32 height, vk::Format src_pixel_format,
         cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *sampled_texture_pl_layout, 0U,
                                   desc_set, {});
     }
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, SmoothPipeline(dst_pixel_format));
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                        SmoothPipeline(dst_pixel_format, fine_only));
 
     const vk::Viewport viewport = {
         .x = 0,
@@ -374,6 +379,11 @@ void BlitHelper::CreateShaders() {
                                              vk::ShaderStageFlagBits::eFragment, device);
     resolve_aa_frag =
         Vulkan::Compile(HostShaders::RESOLVE_AA_FRAG, vk::ShaderStageFlagBits::eFragment, device);
+    if (const float fine = Vulkan::Foveation::CoarseFrom(); fine <= 1.0f) {
+        resolve_aa_fine_frag =
+            Vulkan::Compile(HostShaders::RESOLVE_AA_FRAG, vk::ShaderStageFlagBits::eFragment,
+                            device, {fmt::format("FINE_RADIUS={:.3f}", fine)});
+    }
 }
 
 void BlitHelper::CreatePipelineLayouts() {
@@ -454,10 +464,12 @@ void BlitHelper::CreatePipelineLayouts() {
     linear_sampler = std::move(sampler);
 }
 
-vk::Pipeline BlitHelper::SmoothPipeline(vk::Format attachment_format) {
+vk::Pipeline BlitHelper::SmoothPipeline(vk::Format attachment_format, bool fine_only) {
+    fine_only = fine_only && resolve_aa_fine_frag;
+    auto& pipelines = fine_only ? resolve_aa_fine_pl : resolve_aa_pl;
     const auto it =
-        std::ranges::find(resolve_aa_pl, attachment_format, &decltype(resolve_aa_pl)::value_type::first);
-    if (it != resolve_aa_pl.end()) {
+        std::ranges::find(pipelines, attachment_format, &decltype(resolve_aa_pl)::value_type::first);
+    if (it != pipelines.end()) {
         return *it->second;
     }
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
@@ -486,7 +498,7 @@ vk::Pipeline BlitHelper::SmoothPipeline(vk::Format attachment_format) {
     };
     shader_stages[1] = {
         .stage = vk::ShaderStageFlagBits::eFragment,
-        .module = resolve_aa_frag,
+        .module = fine_only ? resolve_aa_fine_frag : resolve_aa_frag,
         .pName = "main",
     };
 
@@ -535,7 +547,7 @@ vk::Pipeline BlitHelper::SmoothPipeline(vk::Format attachment_format) {
     Vulkan::SetObjectName(instance.GetDevice(), *pipeline, "Smoothed resolve {}",
                           vk::to_string(attachment_format));
 
-    return *resolve_aa_pl.emplace_back(attachment_format, std::move(pipeline)).second;
+    return *pipelines.emplace_back(attachment_format, std::move(pipeline)).second;
 }
 
 void BlitHelper::CreateColorToMSDepthPipeline(const MsPipelineKey& key) {

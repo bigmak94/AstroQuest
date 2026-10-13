@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <ranges>
+#include <tuple>
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -22,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_title_upscale.h"
 
 namespace Vulkan {
 
@@ -335,12 +341,23 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    FrameStats::Add(FrameStats::Counter::PipelineLookups);
+    if (last_pipeline != nullptr && graphics_key == last_key && !FrameStats::AbOff("pipelines")) {
+        FrameStats::Add(FrameStats::Counter::PipelineLookupsShort);
+        return last_pipeline;
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        if (stage_fetch_shader != nullptr) {
+            fetch_shader = *stage_fetch_shader;
+        } else {
+            fetch_shader.reset();
+        }
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
+        const auto compile_start = std::chrono::steady_clock::now();
         try {
             if (const auto* vs = infos[u32(Shader::LogicalStage::Vertex)]) {
                 LOG_INFO(Render_Vulkan,
@@ -364,6 +381,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             return nullptr;
         }
 
+        // How long the driver took over it: what a frame that waits for a new pipeline is held
+        // up by (the GPU driver's own cache keeps what it compiled for the next session).
+        LOG_INFO(Render_Vulkan, "Graphics pipeline {:#x} made in {:.1f} ms", pipeline_hash,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           compile_start)
+                     .count());
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
 
@@ -377,7 +400,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         }
         fetch_shader.reset();
     }
-    return it->second.get();
+    last_key = graphics_key;
+    last_pipeline = it->second.get();
+    return last_pipeline;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -515,6 +540,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     fetch_shader = std::nullopt;
 
     Shader::Backend::Bindings binding{};
+    stage_fetch_shader = nullptr;
     const auto bind_stage = [&](Shader::Stage stage_in, Shader::LogicalStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -532,12 +558,12 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
+        const std::optional<Shader::Gcn::FetchShaderData>* fetch_shader_{};
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
-        if (fetch_shader_) {
-            fetch_shader = fetch_shader_;
+        if (fetch_shader_ != nullptr && *fetch_shader_) {
+            stage_fetch_shader = &**fetch_shader_;
         }
         return true;
     };
@@ -620,11 +646,11 @@ bool PipelineCache::RefreshGraphicsStages() {
     }
 
     const auto* vs_info = infos[static_cast<u32>(Shader::LogicalStage::Vertex)];
-    if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {
+    if (vs_info && stage_fetch_shader && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
-        for (const auto& attrib : fetch_shader->attributes) {
+        for (const auto& attrib : stage_fetch_shader->attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
@@ -641,7 +667,7 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
+    std::tie(infos[0], modules[0], std::ignore, compute_key.value) =
         GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding);
     return true;
 }
@@ -699,10 +725,128 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+namespace {
+
+/// What a stage's resources are, as words, without where they are: everything of them that its
+/// specialization (Shader::StageSpecialization) is made of. Two draws of a program that come to
+/// the same words, with the same runtime info, bindings and fetch shader, come to the same
+/// specialization.
+void SharpWords(const Shader::Info& info, const Shader::Gcn::FetchShaderData* fetch,
+                boost::container::small_vector<u32, 96>& words) {
+    words.clear();
+    // V#: word 0 and the low half of word 1 are where the buffer is, word 2 its size (of which
+    // only whether it is 0 counts).
+    const auto add_buffer = [&words](const AmdGpu::Buffer& sharp) {
+        u32 raw[4];
+        static_assert(sizeof(AmdGpu::Buffer) == sizeof(raw));
+        std::memcpy(raw, &sharp, sizeof(raw));
+        words.push_back(raw[2] != 0 ? 1u : 0u);
+        words.push_back(raw[1] & 0xFFFF0000u);
+        words.push_back(raw[3]);
+    };
+    // T#: word 0 and the low six bits of word 1 are where the image is.
+    const auto add_image = [&words](const AmdGpu::Image& sharp) {
+        u32 raw[8];
+        static_assert(sizeof(AmdGpu::Image) == sizeof(raw));
+        std::memcpy(raw, &sharp, sizeof(raw));
+        words.push_back(sharp ? 1u : 0u);
+        words.push_back(raw[1] & ~0x3Fu);
+        words.insert(words.end(), raw + 2, raw + 8);
+    };
+    if (info.stage == Shader::Stage::Vertex && fetch != nullptr) {
+        for (const auto& attrib : fetch->attributes) {
+            add_buffer(attrib.GetSharp(info));
+        }
+    }
+    for (const auto& desc : info.buffers) {
+        const AmdGpu::Buffer sharp = desc.GetSharp(info);
+        add_buffer(sharp);
+        // Whether it is a uniform buffer (Shader::uniform_buffer_limit) goes by its size.
+        words.push_back(desc.IsStorage(sharp) ? 1u : 0u);
+    }
+    for (const auto& desc : info.images) {
+        add_image(desc.GetSharp(info));
+    }
+    for (const auto& desc : info.fmasks) {
+        add_image(desc.GetSharp(info));
+    }
+    for (const auto& desc : info.samplers) {
+        u32 raw[4];
+        const AmdGpu::Sampler sharp = desc.GetSharp(info);
+        static_assert(sizeof(AmdGpu::Sampler) == sizeof(raw));
+        std::memcpy(raw, &sharp, sizeof(raw));
+        words.insert(words.end(), raw, raw + 4);
+    }
+}
+
+/// The stages whose specialization reads more than their resources (the tessellation constants).
+bool Recognizable(Shader::LogicalStage l_stage) {
+    return l_stage != Shader::LogicalStage::TessellationControl &&
+           l_stage != Shader::LogicalStage::TessellationEval;
+}
+
+} // namespace
+
+std::optional<size_t> PipelineCache::Recognize(Program& program,
+                                               const Shader::RuntimeInfo& runtime_info,
+                                               const Shader::Backend::Bindings& start) {
+    const auto& info = program.info;
+    for (size_t i = 0; i < program.seen.size(); ++i) {
+        const auto& seen = program.seen[i];
+        if (seen.start != start ||
+            std::memcmp(&seen.runtime_info, &runtime_info, sizeof(runtime_info)) != 0) {
+            continue;
+        }
+        const auto& fetch = program.modules[seen.perm_idx].spec.fetch_shader_data;
+        if (info.has_fetch_shader) {
+            const u32* code = Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+            if (!fetch || code != seen.fetch_code || seen.fetch_words.empty() ||
+                std::memcmp(code, seen.fetch_words.data(),
+                            seen.fetch_words.size() * sizeof(u32)) != 0) {
+                continue;
+            }
+        }
+        SharpWords(info, fetch ? &*fetch : nullptr, sharp_words);
+        if (!std::ranges::equal(sharp_words, seen.sharp_words)) {
+            continue;
+        }
+        if (i != 0) {
+            std::rotate(program.seen.begin(), program.seen.begin() + i,
+                        program.seen.begin() + i + 1);
+        }
+        return program.seen.front().perm_idx;
+    }
+    return std::nullopt;
+}
+
+void PipelineCache::Remember(Program& program, const Shader::RuntimeInfo& runtime_info,
+                             const Shader::Backend::Bindings& start, size_t perm_idx) {
+    const auto& info = program.info;
+    const auto& fetch = program.modules[perm_idx].spec.fetch_shader_data;
+    Program::Seen seen{.runtime_info = runtime_info, .start = start, .perm_idx = perm_idx};
+    if (info.has_fetch_shader) {
+        // The code as it is now: what the permutation was found for.
+        const auto parsed = Shader::Gcn::ParseFetchShader(info);
+        if (!fetch || !parsed || parsed->size == 0) {
+            return;
+        }
+        seen.fetch_code = Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+        seen.fetch_words.assign(seen.fetch_code, seen.fetch_code + parsed->size / sizeof(u32));
+    }
+    SharpWords(info, fetch ? &*fetch : nullptr, seen.sharp_words);
+    if (program.seen.size() >= Program::MaxSeen) {
+        program.seen.pop_back();
+    }
+    program.seen.insert(program.seen.begin(), std::move(seen));
+}
+
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(stage, l_stage);
+    if (stage == Stage::Fragment) {
+        runtime_info.fs_info.scene_upscale = TitleUpscale::For(params.hash, instance);
+    }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
@@ -714,7 +858,10 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
+        if (Recognizable(l_stage)) {
+            Remember(*program, runtime_info, start, 0);
+        }
+        return std::make_tuple(&program->info, module, &program->modules[0].spec.fetch_shader_data,
                                perm_hash);
     }
 
@@ -723,6 +870,44 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+
+    const auto start = binding;
+    if (Recognizable(l_stage) && !FrameStats::AbOff("pipelines")) {
+        FrameStats::Add(FrameStats::Counter::StagePrograms);
+        if (const auto seen = Recognize(*program, runtime_info, start)) {
+            FrameStats::Add(FrameStats::Counter::StageProgramsShort);
+            // SHADPS4_DBG_CHECK_RECOGNIZE=1: what the long way finds as well, and a line in the
+            // log where the two differ.
+            static const bool check = [] {
+                const char* value = std::getenv("SHADPS4_DBG_CHECK_RECOGNIZE");
+                return value != nullptr && value[0] == '1';
+            }();
+            if (check) {
+                static u64 checked = 0;
+                static u64 differed = 0;
+                const auto spec = Shader::StageSpecialization(info, runtime_info, profile, start);
+                const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+                const size_t found = it == program->modules.end()
+                                         ? program->modules.size()
+                                         : static_cast<size_t>(it - program->modules.begin());
+                ++checked;
+                if (found != *seen) {
+                    ++differed;
+                    LOG_ERROR(Render_Vulkan,
+                              "Shader {:#x} ({}): recognized as permutation {}, the long way "
+                              "finds {} ({} of {} checks differed)",
+                              params.hash, stage, *seen, found, differed, checked);
+                } else if (checked % 100000 == 0) {
+                    LOG_INFO(Render_Vulkan, "Shader permutations recognized: {} checked, {} differed",
+                             checked, differed);
+                }
+            }
+            info.AddBindings(binding);
+            const auto& module = program->modules[*seen];
+            return std::make_tuple(&info, module.module, &module.spec.fetch_shader_data,
+                                   HashCombine(params.hash, *seen));
+        }
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
@@ -743,8 +928,11 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
+    if (Recognizable(l_stage)) {
+        Remember(*program, runtime_info, start, perm_idx);
+    }
     return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+                           &program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
@@ -760,6 +948,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             }
         }
     }
+    last_pipeline = nullptr;
     if (module_related_pipelines.contains(module)) {
         auto& pipeline_keys = module_related_pipelines[module];
         for (auto& key : pipeline_keys) {

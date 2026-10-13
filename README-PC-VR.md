@@ -293,9 +293,9 @@ is optional.
 
 | Setting | Meaning |
 | --- | --- |
-| `resolution=2880` | the width of each eye's picture: `1440` (the console's largest), `1800`, `2160`, `2520`, `2880` (default), `3240`, `3600`; or `game` for the console's sizes chosen by the game. The game draws a step smaller by itself while the graphics card falls behind |
+| `resolution=2880` | the width of each eye's picture: `816`, `960`, `1200` (the console's smaller sizes, kept to: for a headset with fewer pixels, such as a Rift S), `1440` (the console's largest), `1800`, `2160`, `2520`, `2880` (default), `3240`, `3600`; or `game` for the console's sizes chosen by the game. From `1440` up the game draws a step smaller by itself while the graphics card falls behind |
 | `dynamic=0` | hold the game to the chosen size even where the graphics card falls behind |
-| `fps=60` | the most frames a second: `120`, `90`, `72`, `60` (default), `45`, `40`, `36`, `30`; what the headset's refresh rate allows (see "Speed") |
+| `fps=60` | the most frames a second: `120`, `90`, `80`, `72`, `60` (default), `45`, `40`, `36`, `30`; what the headset's refresh rate allows (see "Speed"; `80` for a Rift S at its 80 Hz) |
 | `fov=100` | how much of the headset's field of view the game draws, 70 to 100 percent: 100 fills all of it; less puts the same pixels over fewer degrees, sharper, with a dark border |
 | `fov_of=psvr` | `fov` is a percent of a PlayStation VR's field of view (100 by 103 degrees an eye, what the game was made for) instead of the headset's own (`fov_of=headset`, the default) |
 | `menu=0` | no window with the main settings at the start |
@@ -469,6 +469,27 @@ Things that had to be right, for whoever works on this again:
   Desktop has its own only while it streams to the headset, and names the PC's until then.
   Every port plays on a device of its own, never on "the default device" as such (see
   "Fixed and added in 0.19").
+
+## Fixed and added in 0.21 (2026-10-13)
+
+- **A game package that stopped unpacking partway** (issue #28): in an AstroQuest folder whose
+  path had more than about 93 characters, the launcher let the unpacking start, and PkgTool
+  stopped a few seconds in on a path too long for Windows, with a message that wrongly blamed
+  an encrypted package. Packages are now unpacked into `games\.u`, where no path is longer
+  than the game's own will be, and a path that is still too long is named as such.
+- **80 frames a second and the console's smaller pictures in the launcher** (issue #22): the
+  Rift S refreshes 80 times a second, which the launcher did not offer; and the picture an eye
+  can now also be 816, 960 or 1200 pixels wide, the sizes the console itself chooses from, for
+  a PC that cannot hold 1440.
+- **Native Linux** (pull request #27 by justinlindh, issue #13): the OpenXR host builds and
+  runs on Linux; see "Linux, native build" below.
+- **A wait between drawing passes that was missing**: the game draws both eyes into one depth
+  buffer, and the second eye's clear followed the first eye's drawing without a barrier. On
+  the Quest that made black squares in the right eye (`README-QUEST-VR.md`, "Also in 0.21: no
+  more black squares"); on the PCs tried here it never showed, but the wait is there now too.
+- The emulator's work for every draw is smaller (the pipeline and texture lookups take
+  shortcuts, draws that write nothing are left out), made for the Quest and in the PC's build
+  as well.
 
 ## Fixed in 0.20 (2026-10-06): two things in world 2
 

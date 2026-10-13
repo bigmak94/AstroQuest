@@ -391,6 +391,10 @@ public:
     Id read_const{};
     Id read_const_dynamic{};
 
+    /// vec4 scene_easu(vec2 uv, vec4 bilinear): what a known title's final pass reads of its
+    /// scene (its one texture) at uv, given what it read there itself (SceneUpscale).
+    Id scene_easu{};
+
 private:
     void DefineArithmeticTypes();
     void DefineInterfaces();
@@ -415,6 +419,8 @@ private:
     Id DefineGetBdaPointer();
 
     Id DefineReadConst(bool dynamic);
+
+    Id DefineSceneEasu();
 
     Id GetBufferSize(u32 sharp_idx);
 };

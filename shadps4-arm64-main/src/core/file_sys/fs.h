@@ -54,6 +54,9 @@ public:
     std::filesystem::path GetHostPath(std::string_view guest_directory,
                                       bool* is_read_only = nullptr,
                                       HostPathType host_path = HostPathType::Default);
+    /// What GetHostPath finds before a known title has its say (KnownTitle::SceneFile).
+    std::filesystem::path FindHostPath(std::string_view guest_directory, bool* is_read_only,
+                                       HostPathType host_path);
     using IterateDirectoryCallback =
         std::function<void(const std::filesystem::path& host_path, bool is_file)>;
     void IterateDirectory(std::string_view guest_directory,

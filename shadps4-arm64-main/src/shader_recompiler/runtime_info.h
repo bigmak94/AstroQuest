@@ -176,6 +176,35 @@ struct PsColorBuffer {
     bool operator==(const PsColorBuffer& other) const = default;
 };
 
+/// How the final pass of a known title, which enlarges the title's scene to the picture it hands
+/// to a headset, reads that scene (Vulkan::TitleUpscale): as the title asks (bilinearly), or with
+/// AMD FidelityFX Super Resolution 1's edge adaptive filter (EASU), which the pass's pixel shader
+/// is then compiled with in place of its one read of the scene.
+struct SceneUpscale {
+    /// A scene wider than this (its width over its height) is the one for the TV, which nothing
+    /// shows while the headset is in use: read as the title asks. The eyes' are taller than wide.
+    static constexpr float WidestScene = 4.0f / 3.0f;
+
+    /// EASU where the scene is enlarged by at least this much on both axes (more than 1); 0: the
+    /// title's own read everywhere.
+    float least_scale;
+    /// Where EASU stops, as a share of the way from the middle of the picture to its edge (on
+    /// both axes): the title's own read beyond, where the scene is shaded coarsely. From 1.5 on
+    /// it does not stop (the corners are at 1.42).
+    float fine_radius;
+    /// The filter's arithmetic in 16 bits where the GPU has that (as FSR 1 itself does it).
+    bool half;
+    /// Where the four texels nearest a place differ by next to nothing, the title's own read is
+    /// kept without the rest of the filter: EASU returns something between those four, as the
+    /// bilinear read does.
+    bool skip_flat;
+    /// (So that no byte of the struct is padding: runtime infos are compared byte by byte.)
+    u16 unused{};
+
+    bool operator==(const SceneUpscale&) const noexcept = default;
+};
+static_assert(sizeof(SceneUpscale) == 12);
+
 struct FragmentRuntimeInfo {
     struct PsInput {
         u8 param_index;
@@ -198,6 +227,7 @@ struct FragmentRuntimeInfo {
     u8 mrtz_mask{};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};
+    SceneUpscale scene_upscale{};
 
     bool operator==(const FragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -205,6 +235,7 @@ struct FragmentRuntimeInfo {
                num_inputs == other.num_inputs && z_export_format == other.z_export_format &&
                mrtz_mask == other.mrtz_mask && dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
+               scene_upscale == other.scene_upscale &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

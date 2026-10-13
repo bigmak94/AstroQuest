@@ -29,6 +29,7 @@
 #include "held_pad.h"
 #include "log.h"
 #include "pad_router.h"
+#include "panel_place.h"
 
 namespace Protocol = Core::Vr::Protocol;
 
@@ -689,8 +690,9 @@ private:
         if (!blitter.Create()) {
             return false;
         }
-        LOGI("frames are copied to the compositor's image %s",
-             !srgb || blitter.WritesUnencoded() ? "as they are" : "through a decoder");
+        LOGI("frames are copied to the compositor's image %s%s",
+             !srgb || blitter.WritesUnencoded() ? "as they are" : "through a decoder",
+             copy_timer.Create() ? "; the GPU's time for that is timed" : "");
         return frames.Create(gl.display, frame_width, frame_height, core);
     }
 
@@ -711,6 +713,12 @@ private:
                         ApplySessionSettings();
                         // The game waited while nobody wore the headset.
                         core.SetPaused(false);
+                        if (panel_pose) {
+                            // Whoever puts the headset back on finds the panel in front of
+                            // them, wherever they turned meanwhile.
+                            panel_pose.reset();
+                            panel_reason = "the headset put on again";
+                        }
                     }
                     break;
                 }
@@ -746,7 +754,13 @@ private:
                 const auto& changed =
                     *reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
                 if (changed.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
-                    space_change_time = changed.changeTime;
+                    // (0 would be "none".)
+                    space_change_time = std::max<XrTime>(changed.changeTime, 1);
+                    // The panel that stands in the room comes along: from that moment it is
+                    // placed afresh, in front of the player, where the reset puts ahead.
+                    // (Its own time: SendPadPose takes space_change_time against a pose time
+                    // beyond the frame's.)
+                    panel_change_time = std::max<XrTime>(changed.changeTime, 1);
                 }
             } else if (event.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
                 const auto& changed =
@@ -768,25 +782,32 @@ private:
                 std::vector<float> rates(count);
                 enumerate(session, count, &count, rates.data());
                 std::string list;
+                uint32_t offered = 0;
                 for (uint32_t i = 0; i < count && i < rates.size(); ++i) {
                     list += (list.empty() ? "" : ", ") + std::to_string(static_cast<int>(rates[i]));
+                    const int hz = static_cast<int>(rates[i] + 0.5f);
+                    offered |= hz == 72 ? 1u : hz == 80 ? 2u : hz == 90 ? 4u : hz == 120 ? 8u : 0u;
                 }
+                host_status.offered_rates = offered;
                 LOGI("display refresh rates on offer: %s Hz", list.c_str());
             }
-            const auto request = GetFunction<PFN_xrRequestDisplayRefreshRateFB>(
+            request_refresh_rate = GetFunction<PFN_xrRequestDisplayRefreshRateFB>(
                 instance, "xrRequestDisplayRefreshRateFB");
-            if (request != nullptr && options.refresh_rate > 0.0f) {
-                Check(request(session, options.refresh_rate), "xrRequestDisplayRefreshRateFB");
-            } else if (request != nullptr) {
-                // The emulated headset refreshes when this display does, and the game draws
-                // one frame for every two refreshes where it manages that and one for every
-                // three where it does not (the emulator holds it to whole numbers). At 90 Hz
-                // that is 45 frames a second in light scenes and 30 in the levels, with room
-                // for the scene at the size the console draws it at; at 72 Hz the levels sit
-                // just beyond what two refreshes allow, and get the smallest picture and
-                // frames of uneven length for it.
-                for (const float rate : {90.0f, 80.0f, 72.0f}) {
-                    if (XR_SUCCEEDED(request(session, rate))) {
+            // What the startup menu chose last, if it changed it while this session ran.
+            const float asked = asked_refresh_rate > 0.0f ? asked_refresh_rate
+                                                          : options.refresh_rate;
+            const bool granted = request_refresh_rate != nullptr && asked > 0.0f &&
+                                 Check(request_refresh_rate(session, asked),
+                                       "xrRequestDisplayRefreshRateFB");
+            if (request_refresh_rate != nullptr && !granted) {
+                // Nothing asked for, or a rate this headset does not have. The emulated headset
+                // refreshes when this display does, and the game draws one frame for a whole
+                // number of refreshes (the emulator chooses how many): at 90 Hz 45 or 30 frames
+                // a second, and the levels get the 30 with three pictures of the compositor's
+                // each instead of 120 Hz's four (each of them GPU time the game does not have).
+                // At 120 Hz it is 60, 40 or 30, at 80 Hz 40 and at 72 Hz 36.
+                for (const float rate : {90.0f, 120.0f, 80.0f, 72.0f}) {
+                    if (XR_SUCCEEDED(request_refresh_rate(session, rate))) {
                         break;
                     }
                 }
@@ -1113,8 +1134,14 @@ private:
 
         // Into the lower left corner when the picture is to be smaller than the image.
         glBindFramebuffer(GL_FRAMEBUFFER, game_swapchain.framebuffers[index]);
+        // What the image held is drawn over, or lies outside what the compositor shows: the
+        // GPU need not keep it (a driver that draws in tiles would read it in first).
+        const GLenum color = GL_COLOR_ATTACHMENT0;
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &color);
+        copy_timer.Begin();
         blitter.Draw(frames.Texture(frame.buffer), layer_width, layer_height,
                      frame.swap_red_blue != 0, decode_srgb, host_status.reduced_fov, frame.fov);
+        copy_timer.End();
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         shown_width = layer_width;
         shown_height = layer_height;
@@ -1160,9 +1187,64 @@ private:
         status_ready = true;
     }
 
+    /// Places the panel that stands still in the room (panel_pose) where it is not placed yet,
+    /// and anew once the headset's own reset of the view has moved the seated space: ahead of
+    /// where the head faces at `time`. False while the headset cannot say where the head is.
+    bool PlacePanel(XrTime time) {
+        if (panel_change_time != 0 && time >= panel_change_time) {
+            panel_change_time = 0;
+            panel_pose.reset();
+            panel_reason = "the headset's own view reset";
+        }
+        if (panel_pose) {
+            return true;
+        }
+        const XrSpaceLocationFlags needed =
+            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+        const bool located =
+            XR_SUCCEEDED(xrLocateSpace(view_space, local_space, time, &location)) &&
+            (location.locationFlags & needed) == needed;
+        const XrPosef& head = location.pose;
+        if (!located || !std::isfinite(head.position.x) || !std::isfinite(head.position.y) ||
+            !std::isfinite(head.position.z)) {
+            if (!panel_wait_logged) {
+                panel_wait_logged = true;
+                LOGI("the headset cannot say where the head is yet: the panel follows the head "
+                     "until it can");
+            }
+            return false;
+        }
+        const PanelPlace::Pose placed = PanelPlace::InFront(
+            {head.position.x, head.position.y, head.position.z},
+            {head.orientation.x, head.orientation.y, head.orientation.z, head.orientation.w},
+            PanelDistance, PanelDrop);
+        panel_pose = XrPosef{{placed.orientation.x, placed.orientation.y, placed.orientation.z,
+                              placed.orientation.w},
+                             {placed.position.x, placed.position.y, placed.position.z}};
+        LOGI("the panel stands still in the room: %.1f m ahead of the head, %.0f degrees to the "
+             "left of the headset's straight ahead (%s)",
+             PanelDistance, placed.heading * Degrees, panel_reason);
+        return true;
+    }
+
     void Loop() {
         while (!quit && !exit_requested) {
             PollEvents();
+            if (session_running && host_status.wanted_refresh_rate.load() > 0.0f) {
+                // Chosen in the startup menu: the display switches now.
+                const float wanted = host_status.wanted_refresh_rate.exchange(0.0f);
+                asked_refresh_rate = wanted;
+                if (request_refresh_rate != nullptr) {
+                    const XrResult result = request_refresh_rate(session, wanted);
+                    LOGI("display refresh rate %.0f Hz asked for in the startup menu (%d)", wanted,
+                         static_cast<int>(result));
+                    if (XR_FAILED(result)) {
+                        // The display keeps the rate it has; a later start asks for that.
+                        asked_refresh_rate = host_status.refresh_rate.load();
+                    }
+                }
+            }
             if (!session_running) {
                 if (options.probe && !probed) {
                     probed = true;
@@ -1248,7 +1330,22 @@ private:
                     quad.subImage.swapchain = status_swapchain.handle;
                     quad.subImage.imageRect.extent = {StatusImage::Width, StatusImage::Height};
                     quad.pose.orientation.w = 1.0f;
-                    if (stale) {
+                    if (!shown_frame) {
+                        // The start-up menu, and what the panel says after it until the game
+                        // has a picture: it stands still in the room where the player faced
+                        // when it appeared, and the head looks at it and away from it. Until
+                        // the headset can say where the head is, it hangs where it will stand
+                        // and follows the head.
+                        if (PlacePanel(frame_state.predictedDisplayTime)) {
+                            quad.space = local_space;
+                            quad.pose = *panel_pose;
+                        } else {
+                            quad.pose.position = {0.0f, -PanelDrop, -PanelDistance};
+                        }
+                        quad.size = PanelSize;
+                    } else if (stale) {
+                        // The game stopped drawing (a long load, or a core that died): said
+                        // wherever the player looks.
                         quad.pose.position = {0.0f, 0.0f, -1.6f};
                         quad.size = {1.4f, 0.7f};
                     } else if (card) {
@@ -1311,15 +1408,25 @@ private:
         }
         const float seconds = std::chrono::duration<float>(now - last_report).count();
         const CoreProcess::Usage usage = core.GetUsage();
+        const GpuTimer::Summary copy = copy_timer.Take();
+        char copy_text[128] = "";
+        if (copy.count != 0) {
+            // From its start on the GPU to its end, so with whatever the compositor did in
+            // between (it takes the GPU at every refresh): the worst is mostly that.
+            std::snprintf(copy_text, sizeof(copy_text),
+                          "; a frame's copy took %.2f ms of GPU time from start to end, %.2f at "
+                          "worst",
+                          copy.mean_ms, copy.worst_ms);
+        }
         LOGI("pacing: game %.1f fps, display %.1f Hz; emulator %.0f%% of a processor on %s, "
              "%d MB; head tracked %.0f%%; picture shown at %ux%u an eye (the system recommends "
-             "%dx%d)",
+             "%dx%d)%s",
              static_cast<float>(frame_count - reported_frames) / seconds,
              static_cast<float>(display_frames) / seconds,
              (usage.cpu_seconds - reported_cpu_seconds) * 100.0 / seconds,
              usage.cpus.empty() ? "?" : usage.cpus.c_str(), usage.memory_mb,
              100.0f * static_cast<float>(head_tracked_frames) / static_cast<float>(display_frames),
-             shown_width / 2, shown_height, recommended_width, recommended_height);
+             shown_width / 2, shown_height, recommended_width, recommended_height, copy_text);
         if (head_tracked_frames != 0) {
             // Where the head is in the headset's own space, which the emulator counts from the
             // player's seat: a view that is off shows here as a head that has moved away from
@@ -1560,6 +1667,13 @@ private:
             message.flags |= Protocol::PadPose::RecenterSeat;
             LOGI("view reset: %s", system_reset ? "the headset's own" : "asked for by the player");
         }
+        if ((requests & XrRecenter::Pad) != 0 && panel_pose && !shown_frame) {
+            // A reset the player asks for (OPTIONS held, both sticks in, the PS button; not
+            // the first press of X, which only takes the seat) brings the start-up panel in
+            // front of them as well.
+            panel_pose.reset();
+            panel_reason = "the player's view reset";
+        }
         // The steps the player wants to be turned round by where they sit (a button held
         // and the right stick flicked, see PadRouter): one a message.
         turns_asked += pads.TakeTurn();
@@ -1759,6 +1873,7 @@ private:
     void Shutdown() {
         frames.Destroy(gl.display);
         blitter.Destroy();
+        copy_timer.Destroy();
         if (instance != XR_NULL_HANDLE) {
             const auto destroy_hand_tracker =
                 GetFunction<PFN_xrDestroyHandTrackerEXT>(instance, "xrDestroyHandTrackerEXT");
@@ -1895,7 +2010,9 @@ private:
     };
     std::vector<Metric> metrics;
     PFN_xrQueryPerformanceMetricsCounterMETA query_metric{};
-
+    PFN_xrRequestDisplayRefreshRateFB request_refresh_rate{};
+    // The refresh rate the startup menu last asked for while the session ran (0: none).
+    float asked_refresh_rate{};
 
     /// The least of the image the game's picture is shown at, whatever the system recommends.
     static constexpr float MinLayerScale = 0.85f;
@@ -1913,6 +2030,7 @@ private:
     Swapchain game_swapchain;
     Swapchain status_swapchain;
     FrameBlitter blitter;
+    GpuTimer copy_timer;
     FrameBuffers frames;
 
     std::optional<Protocol::Frame> shown_frame;
@@ -1942,6 +2060,23 @@ private:
     XrVector3f controller_from_head{};
     uint64_t status_version{};
     bool status_ready{};
+    /// Where the panel stands in the seated space while the game has no picture yet (the
+    /// start-up menu and what follows it): still in the room, not following the head. Placed
+    /// the first time it is shown, and again after a reset of the view or when the headset
+    /// is put back on (see PlacePanel).
+    std::optional<XrPosef> panel_pose;
+    /// When the headset's own reset of the view moves the seated space (0: it does not): the
+    /// panel is placed afresh from then on.
+    XrTime panel_change_time{};
+    /// What the next placing of the panel is for, for the log.
+    const char* panel_reason{"first shown"};
+    bool panel_wait_logged{};
+    /// The panel standing in the room: as large to the eye as the one that followed the head
+    /// (47 by 25 degrees; its 1024 pixels at 22 a degree, against the display's 25 or so), 1.5 m
+    /// away and a hand's breadth below the eyes (its middle 4 degrees down).
+    static constexpr float PanelDistance = 1.5f;
+    static constexpr float PanelDrop = 0.1f;
+    static constexpr XrExtent2Df PanelSize{1.3f, 0.65f};
     float ipd{0.063f};
     uint32_t frames_since_optics{};
 };

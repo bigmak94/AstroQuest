@@ -3,6 +3,7 @@
 
 #include <xxhash.h>
 
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -18,6 +19,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_gpu_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/staging_diag.h"
@@ -30,6 +32,25 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+// SHADPS4_DBG_TRACE_IMAGES=1: every image the cache takes on or lets go of, and every request
+// answered with an image of another size, in the log (issue #19).
+static bool TraceImages() {
+    static const bool trace = [] {
+        const char* value = std::getenv("SHADPS4_DBG_TRACE_IMAGES");
+        return value != nullptr && value[0] == '1';
+    }();
+    return trace;
+}
+
+static void TraceImage(std::string_view what, const ImageInfo& info, u32 index) {
+    LOG_INFO(Render_Vulkan, "IMAGES {} {} at {:#x}+{:#x} {}x{} {} levels {} layers {}{}{}", what,
+             index, info.guest_address, info.guest_size, info.size.width, info.size.height,
+             vk::to_string(info.pixel_format), info.resources.levels, info.resources.layers,
+             info.props.is_depth ? " depth" : "",
+             info.meta_info.htile_addr ? fmt::format(" htile {:#x}", info.meta_info.htile_addr)
+                                       : std::string{});
+}
 static constexpr std::size_t MaxViewDimensionMismatchRecords = 64;
 
 static void LogViewDimensionMismatch(const TextureCache::ImageDesc& desc, const Image& image) {
@@ -768,6 +789,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
+    if (TraceImages() && !perfect_match &&
+        (image.info.size != info.size || image.info.guest_address != info.guest_address)) {
+        TraceImage(fmt::format("asked for (type {}) answered with {} {}x{} mip {} slice {}:",
+                               static_cast<int>(desc.type), image_id.index,
+                               image.info.size.width, image.info.size.height, view_mip,
+                               view_slice),
+                   info, 0);
+    }
 
     if (perfect_match && image_id == perfect_match) {
         found = {
@@ -791,6 +820,109 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         desc.view_info.range.base.layer = view_slice;
     }
 
+    return image_id;
+}
+
+ImageId TextureCache::FindTextureImage(const AmdGpu::Image& sharp,
+                                       const Shader::ImageResource& resource, u32 index,
+                                       ImageDesc& desc) {
+    std::array<u64, 4> words;
+    static_assert(sizeof(AmdGpu::Image) == sizeof(words));
+    std::memcpy(words.data(), &sharp, sizeof(words));
+    // Everything else ImageDesc and the mip level of the binding depend on.
+    const u64 use = u64{resource.is_depth} | u64{resource.is_atomic} << 1 |
+                    u64{resource.is_array} << 2 | u64{resource.is_written} << 3 |
+                    u64{resource.is_r128} << 4 |
+                    u64{static_cast<u32>(resource.mip_fallback_mode)} << 8 |
+                    u64{resource.constant_mip_index} << 16 | u64{index} << 40;
+    const u64 hash = (words[0] * 0x9E3779B97F4A7C15ULL) ^ (words[1] * 0xC2B2AE3D27D4EB4FULL) ^
+                     (words[2] * 0x165667B19E3779F9ULL) ^ ((words[3] + use) * 0x27D4EB2F165667C5ULL);
+    auto& found = found_textures[(hash ^ (hash >> 31)) % found_textures.size()];
+    const auto describe = [&](ImageDesc& out) {
+        out = ImageDesc{sharp, resource};
+        if (resource.mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+            out.view_info.range.base.level += resource.constant_mip_index;
+            out.view_info.range.extent.levels = 1;
+        } else if (resource.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+            out.view_info.range.base.level += index;
+            out.view_info.range.extent.levels = 1;
+        }
+    };
+    if (!Vulkan::FrameStats::AbOff("textures")) {
+        ImageId remembered{};
+        {
+            std::scoped_lock lock{mutex};
+            if (found.registrations == registrations && found.sharp == words &&
+                found.use == use && !slot_images[found.image_id].binding.needs_rebind) {
+                Image& image = slot_images[found.image_id];
+                Vulkan::FrameStats::Add(Vulkan::FrameStats::Counter::ImageLookups);
+                Vulkan::FrameStats::Add(Vulkan::FrameStats::Counter::ImageLookupsShort);
+                desc = found.desc;
+                image.tick_accessed_last = scheduler.CurrentTick();
+                TouchImage(image);
+                remembered = found.image_id;
+            }
+        }
+        if (remembered) {
+            // SHADPS4_DBG_CHECK_RECOGNIZE=1: what the long way finds as well, and a line in the
+            // log where the two differ.
+            static const bool check = [] {
+                const char* value = std::getenv("SHADPS4_DBG_CHECK_RECOGNIZE");
+                return value != nullptr && value[0] == '1';
+            }();
+            if (check) {
+                static u64 checked = 0;
+                static u64 differed = 0;
+                ImageDesc long_way;
+                describe(long_way);
+                const ImageId long_id = FindImage(long_way);
+                ++checked;
+                if (long_id != remembered || long_way.view_info != desc.view_info ||
+                    long_way.type != desc.type ||
+                    long_way.info.guest_address != desc.info.guest_address ||
+                    long_way.info.guest_size != desc.info.guest_size ||
+                    long_way.info.pixel_format != desc.info.pixel_format) {
+                    ++differed;
+                    LOG_ERROR(Render_Vulkan,
+                              "Texture at {:#x}: remembered as image {}, the long way finds {} "
+                              "({} of {} checks differed)",
+                              desc.info.guest_address, remembered.index, long_id.index, differed,
+                              checked);
+                } else if (checked % 100000 == 0) {
+                    LOG_INFO(Render_Vulkan, "Textures remembered: {} checked, {} differed",
+                             checked, differed);
+                }
+            }
+            return remembered;
+        }
+    }
+
+    describe(desc);
+    u64 before;
+    {
+        std::scoped_lock lock{mutex};
+        before = registrations;
+    }
+    const ImageId image_id = FindImage(desc);
+    std::scoped_lock lock{mutex};
+    if (!image_id || registrations != before) {
+        return image_id;
+    }
+    // Remembered only where the image is the one asked for as it is, which is what holds
+    // until an image comes or goes (as in FindImage).
+    const Image& image = slot_images[image_id];
+    const auto& info = desc.info;
+    if (image.info.guest_address == info.guest_address &&
+        image.info.guest_size == info.guest_size && image.info.size == info.size &&
+        IsVulkanFormatCompatible(image.info.pixel_format, info.pixel_format) &&
+        IsViewTypeCompatible(info.type, image.info.type) &&
+        !(image.info.resources < info.resources)) {
+        found.sharp = words;
+        found.use = use;
+        found.registrations = registrations;
+        found.image_id = image_id;
+        found.desc = desc;
+    }
     return image_id;
 }
 
@@ -980,6 +1112,7 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    Vulkan::GpuProfile::Note(Vulkan::GpuProfile::HostWork::ImageUpload, image.info.guest_size);
     scheduler.EndRendering();
 
     const auto [in_buffer, in_offset] =
@@ -1027,6 +1160,9 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
 
 void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
+    if (TraceImages()) {
+        TraceImage("new", image.info, image_id.index);
+    }
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
@@ -1040,6 +1176,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
 
 void TextureCache::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
+    if (TraceImages()) {
+        TraceImage("gone", image.info, image_id.index);
+    }
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;

@@ -218,11 +218,38 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, std::span<const Region
         .levelCount = 1,
         .layerCount = 1,
     };
+    // Where the regions draw every pixel of the frame between them (the two eyes side by side
+    // of a headset's frame), clearing it first only costs time: a frame the size of a
+    // headset's is memory the GPU writes through without compression or tiles.
+    const auto drawn = [&](const Region& region) {
+        const vk::Rect2D& clip = region.clip.value_or(region.area);
+        const s64 left = std::max(region.area.offset.x, clip.offset.x);
+        const s64 top = std::max(region.area.offset.y, clip.offset.y);
+        const s64 right = std::min<s64>(s64{region.area.offset.x} + region.area.extent.width,
+                                        s64{clip.offset.x} + clip.extent.width);
+        const s64 bottom = std::min<s64>(s64{region.area.offset.y} + region.area.extent.height,
+                                         s64{clip.offset.y} + clip.extent.height);
+        return std::array{std::max<s64>(left, 0), std::max<s64>(top, 0),
+                          std::min<s64>(right, frame.width), std::min<s64>(bottom, frame.height)};
+    };
+    s64 covered = 0;
+    bool overlap = false;
+    for (size_t i = 0; i < regions.size(); ++i) {
+        const auto a = drawn(regions[i]);
+        covered += std::max<s64>(a[2] - a[0], 0) * std::max<s64>(a[3] - a[1], 0);
+        for (size_t j = 0; j < i; ++j) {
+            const auto b = drawn(regions[j]);
+            overlap |= a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+        }
+    }
+    // (Under the A/B measuring aid as "ppcopy", the frame is cleared all the same.)
+    const bool covers = !overlap && covered == s64{frame.width} * frame.height &&
+                        !FrameStats::AbOff("ppcopy");
     const std::array<vk::RenderingAttachmentInfo, 1> attachments{{
         {
             .imageView = frame.image_view,
             .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
-            .loadOp = vk::AttachmentLoadOp::eClear,
+            .loadOp = covers ? vk::AttachmentLoadOp::eDontCare : vk::AttachmentLoadOp::eClear,
             .storeOp = vk::AttachmentStoreOp::eStore,
         },
     }};

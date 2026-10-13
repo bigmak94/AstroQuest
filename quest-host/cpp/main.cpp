@@ -169,6 +169,18 @@ JNIEXPORT void JNICALL Java_com_astrobotquest_vrhost_MainActivity_nativeSetField
     }
 }
 
+JNIEXPORT void JNICALL Java_com_astrobotquest_vrhost_MainActivity_nativeSetRefreshRate(
+    JNIEnv*, jobject, jfloat rate) {
+    if (g_app && rate > 0.0f) {
+        g_app->xr_status.wanted_refresh_rate = rate;
+    }
+}
+
+JNIEXPORT jint JNICALL Java_com_astrobotquest_vrhost_MainActivity_nativeRefreshRates(JNIEnv*,
+                                                                                     jobject) {
+    return g_app ? static_cast<jint>(g_app->xr_status.offered_rates.load()) : 0;
+}
+
 JNIEXPORT jfloatArray JNICALL Java_com_astrobotquest_vrhost_MainActivity_nativeHeadsetFov(
     JNIEnv* env, jobject) {
     if (!g_app) {
@@ -309,7 +321,7 @@ JNIEXPORT void JNICALL Java_com_astrobotquest_vrhost_MainActivity_nativeUseContr
 }
 
 /// What the headset's own controllers say to the host's menu: 1 a stick held to the left, 2
-/// to the right, 4 what confirms (A or a trigger).
+/// to the right, 4 what confirms (A or a trigger), 8 a stick held up, 16 down.
 JNIEXPORT jint JNICALL Java_com_astrobotquest_vrhost_MainActivity_nativeTouchMenu(JNIEnv*,
                                                                                   jobject) {
     return g_app ? static_cast<jint>(g_app->pads.TouchMenu()) : 0;

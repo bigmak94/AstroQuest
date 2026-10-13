@@ -16,7 +16,8 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Recompile cached shaders with the corrected geometry input ABI and invocation ID.
 static constexpr u32 ShaderBinaryVersion = 3u;
-static constexpr u32 ShaderMetaVersion = 2u;
+// Shader metadata holds the runtime info, which now says how a final pass reads its scene.
+static constexpr u32 ShaderMetaVersion = 3u;
 static constexpr u32 PipelineKeyVersion = 2u;
 } // namespace Serialization
 

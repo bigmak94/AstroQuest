@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -12,6 +13,7 @@
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_gpu_profile.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -28,6 +30,7 @@ namespace Vulkan {
 class Scheduler;
 class RenderState;
 class GraphicsPipeline;
+class Foveation;
 
 class Rasterizer {
 public:
@@ -45,6 +48,8 @@ public:
 
     /// Logs the next `count` guest draws, dispatches and markers. Debugging aid.
     static void StartDrawTrace(s32 count);
+    /// Whether draws are being traced at the moment.
+    static bool DrawTraceActive();
 
     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
         return buffer_cache;
@@ -53,6 +58,11 @@ public:
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
+
+    /// Whether the title's last final pass read its scene with FSR 1 (TitleUpscale), and within
+    /// how much of the way from the middle to the edges (the rest bilinear).
+    [[nodiscard]] bool EyesUpscaled() const;
+    [[nodiscard]] float UpscaledRadius() const;
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
@@ -123,6 +133,37 @@ private:
 
     /// Set while a draw is made in more than one pass (SharedTargetPasses).
     bool in_target_passes{};
+    /// SkipSecondEye: the frame for the headset the draws are of, and whether its first eye's
+    /// picture has been drawn; whether the draw being made is to be cut down to one triangle.
+    u32 eye_frame{~0u};
+    bool eye_output_seen{};
+    bool thin_second_eye_draw{};
+    /// SHADPS4_DBG_STEREO_TIMING: when this frame's first eye's first scene draw and its picture
+    /// came, and the sums over the frames since the last report.
+    struct EyeTiming {
+        std::chrono::steady_clock::time_point first_scene{};
+        std::chrono::steady_clock::time_point first_picture{};
+        bool counted{};
+    } eye_timing;
+    struct StereoTiming {
+        std::chrono::steady_clock::time_point reported{};
+        double to_second{};
+        double to_picture{};
+        double worst_second{};
+        u32 frames{};
+    } stereo_timing;
+    bool SkipSecondEye(const RenderState& state);
+    /// Notes a draw of the title's final pass (KnownTitle::IsSceneEnlargement) reading `scene`:
+    /// whether its shader reads that with FSR 1 (TitleUpscale).
+    void NoteFinalPass(const VideoCore::Image& scene);
+    /// Sets Shader::uniform_buffer_limit for a draw (`graphics`) or a dispatch.
+    void ChooseUniformBuffers(bool graphics) const;
+    /// Whether a draw, with its render state prepared, writes nothing at all: no colour, no
+    /// depth or stencil, no memory.
+    bool DrawsNothing(const GraphicsPipeline* pipeline) const;
+
+    /// What the draw or dispatch about to be recorded is, for the GPU profile.
+    GpuProfile::Work ProfileWork(const Pipeline* pipeline) const;
 
     void ResetBindings() {
         for (auto& image_id : bound_images) {
@@ -171,6 +212,12 @@ private:
     boost::container::small_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+    /// SHADPS4_GPU_PROFILE (see GpuProfile); null when not asked for.
+    std::unique_ptr<GpuProfile> gpu_profile;
+    /// SHADPS4_VR_FOVEATION (see Foveation); null when not asked for.
+    std::unique_ptr<Foveation> foveation;
+    /// Whether the title's last final pass read its scene with FSR 1 (TitleUpscale).
+    bool eyes_upscaled{};
 };
 
 } // namespace Vulkan

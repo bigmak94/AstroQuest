@@ -9,13 +9,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <string>
+#include <string_view>
 #include <utility>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/renderer_vulkan/vk_gpu_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -259,6 +269,38 @@ std::chrono::steady_clock::time_point FrameStats::TakeGuestSubmit() {
 namespace {
 std::atomic<u32> g_gpu_looks{};
 std::atomic<u32> g_gpu_busy_looks{};
+/// Looks at a known clock, the clocks (MHz) of those that found the GPU busy added up, and the
+/// fastest clock seen.
+std::atomic<u32> g_gpu_clocked_looks{};
+std::atomic<u64> g_gpu_busy_clocks{};
+std::atomic<u32> g_gpu_fastest_clock{};
+std::atomic<u64> g_gpu_thread_ns{};
+std::atomic<u32> g_gpu_thread_frames{};
+/// The same looks for the frame statistics' lines: all of them, the busy ones, and the clocks
+/// of each (MHz, where known) added up.
+std::atomic<u64> g_log_looks{};
+std::atomic<u64> g_log_busy_looks{};
+std::atomic<u64> g_log_clocked_looks{};
+std::atomic<u64> g_log_clocks{};
+
+/// The GPU's clock now, in MHz, where the system tells it (a Qualcomm GPU on Linux); 0 if not.
+u32 GpuClockMhz() {
+#ifdef __linux__
+    static const int file = open("/sys/class/kgsl/kgsl-3d0/gpuclk", O_RDONLY | O_CLOEXEC);
+    if (file < 0) {
+        return 0;
+    }
+    char text[24];
+    const ssize_t length = pread(file, text, sizeof(text) - 1, 0);
+    if (length <= 0) {
+        return 0;
+    }
+    text[length] = '\0';
+    return static_cast<u32>(std::strtoull(text, nullptr, 10) / 1000000);
+#else
+    return 0;
+#endif
+}
 } // namespace
 
 void FrameStats::GpuLook(bool busy) {
@@ -266,6 +308,107 @@ void FrameStats::GpuLook(bool busy) {
     if (busy) {
         g_gpu_busy_looks.fetch_add(1, std::memory_order_relaxed);
     }
+    // The clock is read every eighth look: it does not change faster than that. (One thread
+    // looks.)
+    static u32 looks = 0;
+    static u32 clock = 0;
+    if (looks++ % 8 == 0) {
+        clock = GpuClockMhz();
+        if (clock > g_gpu_fastest_clock.load(std::memory_order_relaxed)) {
+            g_gpu_fastest_clock.store(clock, std::memory_order_relaxed);
+        }
+    }
+    if (clock != 0) {
+        g_gpu_clocked_looks.fetch_add(1, std::memory_order_relaxed);
+        if (busy) {
+            g_gpu_busy_clocks.fetch_add(clock, std::memory_order_relaxed);
+        }
+        g_log_clocked_looks.fetch_add(1, std::memory_order_relaxed);
+        g_log_clocks.fetch_add(clock, std::memory_order_relaxed);
+    }
+    g_log_looks.fetch_add(1, std::memory_order_relaxed);
+    if (busy) {
+        g_log_busy_looks.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+namespace {
+std::array<std::atomic<u64>, static_cast<size_t>(FrameStats::Call::Count)> g_call_ns{};
+std::array<std::atomic<u64>, static_cast<size_t>(FrameStats::Call::Count)> g_call_count{};
+constexpr const char* CallNames[] = {
+    "draw", "push constants", "push descriptors", "vertex input", "vertex buffers",
+    "index buffer", "dynamic state", "pipeline", "pass begin", "pass end", "barrier", "submit",
+};
+} // namespace
+
+bool FrameStats::CallTimesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DBG_CALL_TIMES");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+FrameStats::CallTimer::~CallTimer() {
+    if (!timing) {
+        return;
+    }
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    g_call_ns[static_cast<size_t>(call)].fetch_add(static_cast<u64>(ns), std::memory_order_relaxed);
+    g_call_count[static_cast<size_t>(call)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool FrameStats::AbConcerns(const char* name) {
+    static const std::string only = [] {
+        const char* value = std::getenv("SHADPS4_DBG_AB_ONLY");
+        return std::string{value != nullptr ? value : ""};
+    }();
+    if (only.empty()) {
+        return true;
+    }
+    // (Several names may be given, with commas between them.)
+    const std::string_view wanted{name};
+    std::string_view rest{only};
+    while (true) {
+        const size_t comma = rest.find(',');
+        if (rest.substr(0, comma) == wanted) {
+            return true;
+        }
+        if (comma == std::string_view::npos) {
+            return false;
+        }
+        rest.remove_prefix(comma + 1);
+    }
+}
+
+u32 FrameStats::FastestGpuClock() {
+    return g_gpu_fastest_clock.load(std::memory_order_relaxed);
+}
+
+float FrameStats::TakeGpuWork() {
+    const u32 looks = g_gpu_clocked_looks.exchange(0, std::memory_order_relaxed);
+    const u64 clocks = g_gpu_busy_clocks.exchange(0, std::memory_order_relaxed);
+    const u32 fastest = g_gpu_fastest_clock.load(std::memory_order_relaxed);
+    if (looks == 0 || fastest == 0) {
+        return -1.0f;
+    }
+    return static_cast<float>(static_cast<double>(clocks) /
+                              (static_cast<double>(looks) * static_cast<double>(fastest)));
+}
+
+void FrameStats::NoteGpuThreadFrame(std::chrono::nanoseconds time) {
+    if (time.count() > 0) {
+        g_gpu_thread_ns.fetch_add(static_cast<u64>(time.count()), std::memory_order_relaxed);
+        g_gpu_thread_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+double FrameStats::TakeGpuThreadTime() {
+    const u64 ns = g_gpu_thread_ns.exchange(0, std::memory_order_relaxed);
+    const u32 frames = g_gpu_thread_frames.exchange(0, std::memory_order_relaxed);
+    return frames != 0 ? static_cast<double>(ns) / frames / 1e9 : 0.0;
 }
 
 float FrameStats::TakeGpuLoad() {
@@ -276,7 +419,18 @@ float FrameStats::TakeGpuLoad() {
 
 std::chrono::nanoseconds FrameStats::ThreadTime() {
 #ifdef _WIN32
-    return std::chrono::nanoseconds{0};
+    // Counted by the system at its clock's ticks: right on average over a few seconds.
+    FILETIME created{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        return std::chrono::nanoseconds{0};
+    }
+    const auto ticks = [](const FILETIME& time) {
+        return (u64{time.dwHighDateTime} << 32) | time.dwLowDateTime;
+    };
+    return std::chrono::nanoseconds{(ticks(kernel) + ticks(user)) * 100};
 #else
     timespec time{};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
@@ -285,6 +439,38 @@ std::chrono::nanoseconds FrameStats::ThreadTime() {
 }
 
 void FrameStats::EndFrame() {
+    // The A/B measuring aid (AbOff): which way the frames from now on are drawn.
+    static const double ab_period = [] {
+        const char* value = std::getenv("SHADPS4_DBG_AB");
+        return value != nullptr ? std::max(std::atof(value), 0.0) : 0.0;
+    }();
+    static u32 ab_frames[2]{};
+    if (ab_period > 0.0) {
+        static const auto ab_start = std::chrono::steady_clock::now();
+        const double since =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - ab_start).count();
+        const bool off = static_cast<s64>(since / ab_period) % 2 == 1;
+        ++ab_frames[ab_off.load(std::memory_order_relaxed) ? 1 : 0];
+        ab_off.store(off, std::memory_order_relaxed);
+        // SHADPS4_DBG_AB_TU_DEBUG=<options>: as "tudebug", those of the Turnip driver's options
+        // that it takes while it runs are on in the frames left out: they go into the file named
+        // by TU_DEBUG_FILE, which the driver watches (TU_DEBUG may not name them as well).
+        // (nolrz switched this way stopped the Quest's GPU for good within three minutes.)
+        static const std::string tu_options = [] {
+            const char* value = std::getenv("SHADPS4_DBG_AB_TU_DEBUG");
+            return std::string{value != nullptr ? value : ""};
+        }();
+        static const char* const tu_file = std::getenv("TU_DEBUG_FILE");
+        static int tu_written = -1;
+        if (!tu_options.empty() && tu_file != nullptr && AbConcerns("tudebug") &&
+            tu_written != (off ? 1 : 0)) {
+            if (std::FILE* file = std::fopen(tu_file, "w"); file != nullptr) {
+                std::fputs(off ? tu_options.c_str() : "", file);
+                std::fclose(file);
+            }
+            tu_written = off ? 1 : 0;
+        }
+    }
     if (!Enabled()) {
         return;
     }
@@ -342,12 +528,31 @@ void FrameStats::EndFrame() {
     }
     const double n = static_cast<double>(frames);
     static const auto start = now;
+    std::string ab;
+    if (ab_period > 0.0) {
+        ab = ab_frames[0] != 0 && ab_frames[1] != 0 ? " [A+B]"
+             : ab_frames[1] != 0                    ? " [B]"
+                                                    : " [A]";
+        ab_frames[0] = ab_frames[1] = 0;
+    }
+    // How busy the GPU was, and at what clock, since the last line.
+    const u64 looks = g_log_looks.exchange(0, std::memory_order_relaxed);
+    const u64 busy_looks = g_log_busy_looks.exchange(0, std::memory_order_relaxed);
+    const u64 clocked_looks = g_log_clocked_looks.exchange(0, std::memory_order_relaxed);
+    const u64 clocks = g_log_clocks.exchange(0, std::memory_order_relaxed);
+    std::string gpu;
+    if (looks != 0) {
+        gpu = fmt::format(", GPU busy {:.0f}%", 100.0 * busy_looks / looks);
+        if (clocked_looks != 0) {
+            gpu += fmt::format(" at {:.0f} MHz", static_cast<double>(clocks) / clocked_looks);
+        }
+    }
     LOG_INFO(Render_Vulkan,
-             "frame stats at {:.0f} s: {:.1f} fps, per frame {:.1f} passes ({:.1f} loading their "
-             "targets, {:.1f} Mpx), {:.0f} draws, {:.1f} dispatches, {:.1f} submits",
-             std::chrono::duration<double>(now - start).count(), n / seconds,
+             "frame stats at {:.0f} s{}: {:.1f} fps, per frame {:.1f} passes ({:.1f} loading their "
+             "targets, {:.1f} Mpx), {:.0f} draws, {:.1f} dispatches, {:.1f} submits{}",
+             std::chrono::duration<double>(now - start).count(), ab, n / seconds,
              c.passes.Take() / n, c.loading_passes.Take() / n, c.pass_pixels.Take() / n / 1e6,
-             c.draws.Take() / n, c.computes.Take() / n, c.submits.Take() / n);
+             c.draws.Take() / n, c.computes.Take() / n, c.submits.Take() / n, gpu);
     const auto stage_ms = [](Stage stage) {
         const u64 total = g_stage_times.total[static_cast<size_t>(stage)].exchange(0);
         const u64 count = g_stage_times.count[static_cast<size_t>(stage)].exchange(0);
@@ -369,12 +574,34 @@ void FrameStats::EndFrame() {
     const double lookups = per_frame(Counter::ImageLookups);
     const double binds = per_frame(Counter::PipelineBinds);
     if (lookups > 0.0 || binds > 0.0) {
+        const double stages = per_frame(Counter::StagePrograms);
+        const double stages_short = per_frame(Counter::StageProgramsShort);
+        const double pipelines = per_frame(Counter::PipelineLookups);
+        const double pipelines_short = per_frame(Counter::PipelineLookupsShort);
         LOG_INFO(Render_Vulkan,
                  "frame shortcuts: {:.0f} of {:.0f} image lookups ({:.1f} images added or "
-                 "removed), {:.0f} of {:.0f} pipeline binds; {:.0f} thousand vertices drawn",
+                 "removed), {:.0f} of {:.0f} pipeline binds, {:.0f} of {:.0f} shader "
+                 "permutations, {:.0f} of {:.0f} pipeline lookups; {:.0f} thousand vertices "
+                 "drawn; {:.0f} draws left out that write nothing",
                  per_frame(Counter::ImageLookupsShort), lookups,
                  per_frame(Counter::ImageRegistrations), per_frame(Counter::PipelineBindsShort),
-                 binds, per_frame(Counter::Vertices) / 1e3);
+                 binds, stages_short, stages, pipelines_short, pipelines,
+                 per_frame(Counter::Vertices) / 1e3, per_frame(Counter::EmptyDraws));
+    }
+    if (CallTimesEnabled()) {
+        std::string calls;
+        double total_ms = 0.0;
+        for (size_t i = 0; i < g_call_ns.size(); ++i) {
+            const double ms = static_cast<double>(g_call_ns[i].exchange(0)) / n / 1e6;
+            const double count = static_cast<double>(g_call_count[i].exchange(0)) / n;
+            if (count == 0.0) {
+                continue;
+            }
+            total_ms += ms;
+            calls += fmt::format("{}{} {:.0f}x {:.2f} ms", calls.empty() ? "" : ", ", CallNames[i],
+                                 count, ms);
+        }
+        LOG_INFO(Render_Vulkan, "driver calls per frame: {:.2f} ms in all: {}", total_ms, calls);
     }
     c.frames = 0;
     c.since = now;
@@ -416,6 +643,9 @@ static bool ContinuesPass(const RenderState& current, const RenderState& next) {
             return false;
         }
     }
+    if (current.shading_rate_view != next.shading_rate_view) {
+        return false;
+    }
     const auto& ours = current.depth_stencil_attachment;
     const auto& theirs = next.depth_stencil_attachment;
     return ours.image_view == theirs.image_view && ours.image_layout == theirs.image_layout &&
@@ -434,6 +664,41 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         return;
     }
     EndRendering();
+    // A pass that clears a target writes it again after the passes before, and those may have
+    // written it too: both eyes, for one, are drawn into the same depth buffer, the second
+    // cleared right after the first is done. Nothing else stands between such passes when the
+    // target stays in its layout, and without a barrier the Quest's GPU driver, drawing straight
+    // to memory, lets what the earlier pass left in its cache land on the cleared target later,
+    // block by block: black squares in the right eye where its sky then failed the depth test
+    // (issue #19). Under the A/B measuring aid as "clearbarrier".
+    const auto& depth_target = new_state.depth_stencil_attachment;
+    const bool clears_depth =
+        depth_target.image_view && (depth_target.depth_clear || depth_target.stencil_clear);
+    bool clears_color = false;
+    for (u32 i = 0; i < new_state.num_color_attachments; ++i) {
+        clears_color |= new_state.color_attachments[i].image_view &&
+                        new_state.color_attachments[i].is_clear;
+    }
+    if ((clears_depth || clears_color) && !FrameStats::AbOff("clearbarrier")) {
+        const vk::MemoryBarrier2 earlier_writes = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                            vk::PipelineStageFlagBits2::eLateFragmentTests,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
+                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                            vk::PipelineStageFlagBits2::eLateFragmentTests,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                             vk::AccessFlagBits2::eColorAttachmentWrite |
+                             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        };
+        current_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &earlier_writes,
+        });
+    }
     is_rendering = true;
     render_state = new_state;
     bound_pipeline = nullptr;
@@ -469,7 +734,14 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
                                          vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
     };
 
+    const u32 texel = instance.FoveationTexel();
+    const vk::RenderingFragmentShadingRateAttachmentInfoKHR shading_rate = {
+        .imageView = render_state.shading_rate_view,
+        .imageLayout = vk::ImageLayout::eFragmentShadingRateAttachmentOptimalKHR,
+        .shadingRateAttachmentTexelSize = {texel, texel},
+    };
     const vk::RenderingInfo rendering_info = {
+        .pNext = render_state.shading_rate_view ? &shading_rate : nullptr,
         .renderArea =
             {
                 .offset = {0, 0},
@@ -482,7 +754,10 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    current_cmdbuf.beginRendering(rendering_info);
+    {
+        const FrameStats::CallTimer timer{FrameStats::Call::BeginRendering};
+        current_cmdbuf.beginRendering(rendering_info);
+    }
 
     FrameStats::RenderPass(render_state);
 }
@@ -492,11 +767,16 @@ void Scheduler::EndRendering(std::source_location where) {
         return;
     }
     FrameStats::PassEnded(where);
+    GpuProfile::NotePassEnd(where);
     is_rendering = false;
     bound_pipeline = nullptr;
+    // (SHADPS4_DBG_PUSH_ONCE: what is pushed between passes, by the blit helper among others,
+    // is not known here.)
+    last_push_layout = vk::PipelineLayout{};
     if (const u32 limit = FlushDraws(); limit != 0 && draws_since_flush >= limit) {
         flush_due = true;
     }
+    const FrameStats::CallTimer timer{FrameStats::Call::EndRendering};
     current_cmdbuf.endRendering();
 }
 
@@ -555,6 +835,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+    last_push_layout = vk::PipelineLayout{};
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -655,7 +936,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                       reinterpret_cast<uintptr_t>(static_cast<VkFence>(info.fence))));
     }
     FrameStats::Submit();
+    std::optional<FrameStats::CallTimer> submit_timer;
+    submit_timer.emplace(FrameStats::Call::Submit);
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    submit_timer.reset();
     if (IsSyncTraceEnabled()) {
         TraceSync("submit tick %llu returned %d", static_cast<unsigned long long>(signal_value),
                   static_cast<int>(submit_result));

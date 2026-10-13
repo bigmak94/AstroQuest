@@ -125,9 +125,72 @@ int main(void) {
     VkExtensionProperties* extensions = calloc(extension_count, sizeof(*extensions));
     vkEnumerateDeviceExtensionProperties(physical, NULL, &extension_count, extensions);
     printf("%u device extensions:", extension_count);
+    int has_shading_rate = 0;
     for (uint32_t i = 0; i < extension_count; ++i) {
         printf(" %s", extensions[i].extensionName + 3);
+        has_shading_rate |= strcmp(extensions[i].extensionName,
+                                   VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0;
     }
     printf("\n");
+
+    // What coarser shading towards the edges of a picture (the emulator's foveation) can use.
+    if (has_shading_rate) {
+        VkPhysicalDeviceFragmentShadingRateFeaturesKHR rate_features = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 features2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                               .pNext = &rate_features};
+        vkGetPhysicalDeviceFeatures2(physical, &features2);
+        printf("fragment shading rate: pipeline %u, primitive %u, attachment %u\n",
+               rate_features.pipelineFragmentShadingRate,
+               rate_features.primitiveFragmentShadingRate,
+               rate_features.attachmentFragmentShadingRate);
+        VkPhysicalDeviceFragmentShadingRatePropertiesKHR rate_props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 props2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                              .pNext = &rate_props};
+        vkGetPhysicalDeviceProperties2(physical, &props2);
+        printf("  attachment texel %ux%u .. %ux%u (aspect %u), layered %u, non-trivial combiners %u,"
+               " max fragment %ux%u (%u samples), with sample mask %u, with shader depth/stencil "
+               "writes %u, with sample interlock %u, with custom sample locations %u, strict "
+               "multiply %u\n",
+               rate_props.minFragmentShadingRateAttachmentTexelSize.width,
+               rate_props.minFragmentShadingRateAttachmentTexelSize.height,
+               rate_props.maxFragmentShadingRateAttachmentTexelSize.width,
+               rate_props.maxFragmentShadingRateAttachmentTexelSize.height,
+               rate_props.maxFragmentShadingRateAttachmentTexelSizeAspectRatio,
+               rate_props.layeredShadingRateAttachments,
+               rate_props.fragmentShadingRateNonTrivialCombinerOps,
+               rate_props.maxFragmentSize.width, rate_props.maxFragmentSize.height,
+               rate_props.maxFragmentSizeAspectRatio, rate_props.fragmentShadingRateWithSampleMask,
+               rate_props.fragmentShadingRateWithShaderDepthStencilWrites,
+               rate_props.fragmentShadingRateWithFragmentShaderInterlock,
+               rate_props.fragmentShadingRateWithCustomSampleLocations,
+               rate_props.fragmentShadingRateStrictMultiplyCombiner);
+        PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR get_rates =
+            (PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR)vkGetInstanceProcAddr(
+                instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR");
+        if (get_rates != NULL) {
+            uint32_t rate_count = 0;
+            get_rates(physical, &rate_count, NULL);
+            VkPhysicalDeviceFragmentShadingRateKHR* rates = calloc(rate_count, sizeof(*rates));
+            for (uint32_t i = 0; i < rate_count; ++i) {
+                rates[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR;
+            }
+            get_rates(physical, &rate_count, rates);
+            printf("  rates:");
+            for (uint32_t i = 0; i < rate_count; ++i) {
+                printf(" %ux%u (samples 0x%x)", rates[i].fragmentSize.width,
+                       rates[i].fragmentSize.height, rates[i].sampleCounts);
+            }
+            printf("\n");
+        }
+        VkFormatProperties format_props;
+        vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_R8_UINT, &format_props);
+        printf("  R8_UINT as a shading rate attachment: %s\n",
+               (format_props.optimalTilingFeatures &
+                VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
+                   ? "yes"
+                   : "no");
+    }
     return 0;
 }
