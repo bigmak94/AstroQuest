@@ -1339,6 +1339,13 @@ void TextureCache::RunGarbageCollector() {
         }
         --num_deletions;
         auto& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::Registered)) {
+            // Let go of already (see TouchImage): never twice.
+            LOG_ERROR(Render_Vulkan,
+                      "The garbage collector met image {} again after it was let go",
+                      image_id.index);
+            return false;
+        }
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
@@ -1378,6 +1385,23 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(const Image& image) {
+    // Only an image in the cache has an entry of its own in the LRU list. One let go of
+    // (FreeImage) is looked at once more by whoever still holds it, to see that it needs to be
+    // found again (binding.needs_rebind), and its slot lives on until the GPU is done with it;
+    // a null image never had an entry, its lru_id is entry 0, someone else's. Touched, a free
+    // entry went back into the list, and the garbage collector later let go of its image a
+    // second time ("Trying to unregister an already unregistered image", at the last boss), or
+    // the entry, given to a new image meanwhile, sat in the list twice.
+    if (False(image.flags & ImageFlagBits::Registered)) {
+        static u32 seen = 0;
+        if (seen++ < 3) {
+            LOG_INFO(Render_Vulkan,
+                     "Image at {:#x} ({}x{}) used while not in the cache (let go of, or a null "
+                     "image): its LRU entry is left alone",
+                     image.info.guest_address, image.info.size.width, image.info.size.height);
+        }
+        return;
+    }
     lru_cache.Touch(image.lru_id, gc_tick);
 }
 

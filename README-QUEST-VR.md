@@ -361,6 +361,17 @@ the sandbox by changing the size every four seconds: 8 to 12 pictures with squar
 before, none after. Also: the card on the controls no longer comes up as the game starts,
 only when OPTIONS (the menu button) is pressed.
 
+**App 0.21.1 (2026-10-13): a crash at the last boss.** The emulator stopped there (`core.log`:
+"Trying to unregister an already unregistered image"), right after the picture's size had
+changed three times within a second. Its texture cache keeps a list of the images by when they
+were last used, from which it lets go of the oldest when memory runs short. An image already
+let go of is looked at once more by whoever still holds it, to learn that it has to be found
+again, and the cache's stand-ins for missing textures were never in the list: both counted as
+used, and that put a free entry back into the list, whose image the cache later let go of a
+second time (or the entry, handed to a new image meanwhile, was in the list twice: probably the
+one heap corruption seen under quick changes of size on 2026-10-09). Only images in the cache
+count as used now, and the cache never lets go of an image twice. The same in the PC's build.
+
 **App 0.8 (2026-10-03)**, after the fourth session (levels 1-1 to 1-3 played, the game stopped
 on entering 1-4 twice):
 

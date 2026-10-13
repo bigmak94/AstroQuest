@@ -470,6 +470,13 @@ Things that had to be right, for whoever works on this again:
   Every port plays on a device of its own, never on "the default device" as such (see
   "Fixed and added in 0.19").
 
+## Fixed in 0.21.1 (2026-10-13)
+
+- **A crash at the last boss**, seen on the Quest: the emulator's texture cache let go of the
+  same image twice ("Trying to unregister an already unregistered image" in the log). It lets
+  go of images when memory runs short, which on a PC with a large graphics card happens rarely;
+  the fix is in the PC's build too (`README-QUEST-VR.md`, "App 0.21.1").
+
 ## Fixed and added in 0.21 (2026-10-13)
 
 - **A game package that stopped unpacking partway** (issue #28): in an AstroQuest folder whose
