@@ -304,15 +304,14 @@ Also in 0.21:
   drawing, still follow the head: they are to be read wherever the player looks.)
 - the log says how long the driver took over every new pipeline ("Graphics pipeline ... made
   in ... ms").
-- **black squares at the end of the first level**: not seen here, and not explained yet. Ruled
-  out: a change of the picture's size in the last stretch of the level (there was none until
-  the level ended); a NaN let through by max, min or clamp (the headset's GPU drops NaN in those
-  as the PlayStation 4's does: tested on the device); sizes changing every two seconds in the
-  first level and in the world select (no squares in the pictures taken). The GPU of the
+- **black squares at the end of the first level**: not seen here at first. Ruled out then: a
+  NaN let through by max, min or clamp (the headset's GPU drops NaN in those as the
+  PlayStation 4's does: tested on the device). The pictures taken while sizes changed every
+  two seconds showed none, but they were small, and the scan of them only looked for black in
+  lit surroundings, where the squares later turned out to be on the dark sky. Found and fixed
+  since: see "no more black squares in the right eye" below. The GPU of the
   PlayStation 4 has legacy multiply-adds where zero times anything is zero; the emulator now
-  does them that way too, although no shader of the menus or of the first level uses them. The
-  level's own teardown after its goal (many pictures made and dropped at once, as at the end
-  of 3-2) is what the log has at about that time.
+  does them that way too, although no shader of the menus or of the first level uses them.
 
 **Also in 0.21: FSR 1 for the game's enlargement of its picture, on by default** (after the
 session of midday 2026-10-09: "the resolution is still very low; could some kind of DLSS
