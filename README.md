@@ -78,7 +78,7 @@ Download `AstroQuest-<version>-Quest3.apk` from the
    debugging in the headset, and run
 
    ```sh
-   adb install -r AstroQuest-0.21-Quest3.apk
+   adb install -r AstroQuest-0.21.1-Quest3.apk
    ```
 
    (or drag the APK onto SideQuest).
