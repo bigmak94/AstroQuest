@@ -10,6 +10,7 @@
 // `node tools/ps4elf.mjs unwrap <eboot.bin> <out.elf>`), it also says which build each is.
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -18,6 +19,13 @@
 #include <vector>
 
 #include "core/known_title_builds.h"
+
+#ifdef _WIN32
+extern "C" {
+__declspec(dllimport) void* __stdcall VirtualAlloc(void*, size_t, unsigned long, unsigned long);
+__declspec(dllimport) int __stdcall VirtualFree(void*, size_t, unsigned long);
+}
+#endif
 
 using namespace Core::KnownTitle::Builds;
 
@@ -49,6 +57,23 @@ static std::vector<u8> MadeUp(const Build& build) {
     }
     for (const Change& change : PhysicsStepChanges(build)) {
         std::memcpy(image.data() + change.at, &change.was, change.bytes);
+    }
+    for (const Change& change : PhysicsSubstepChanges(build)) {
+        std::memcpy(image.data() + change.at, &change.was, change.bytes);
+    }
+    for (const Change& change : ThrowLeadChanges(build)) {
+        std::memcpy(image.data() + change.at, &change.was, change.bytes);
+    }
+    {
+        // And the constant the throw multiplies by: 60, four times.
+        const Change first = ThrowLeadChanges(build)[0];
+        s32 distance = 0;
+        std::memcpy(&distance, reinterpret_cast<const u8*>(&first.was) + 4, sizeof(distance));
+        for (u32 i = 0; i < 4; ++i) {
+            Put(image, first.at + 8 + distance + 4 * i, 60.0f);
+        }
+        // And the end of its last instruction, which stays (vmulps ..., xmm1).
+        Put(image, first.at + 16, u16{0xc159});
     }
     for (const Change& change : FrameCountChanges(build)) {
         std::memcpy(image.data() + change.at, &change.was, change.bytes);
@@ -153,6 +178,156 @@ static void CheckPhysicsStep(const Build& build, std::vector<u8> image, const st
     const std::vector<u8> untouched = odd;
     Check(Apply(odd, changes) == &changes.back() && odd == untouched,
           name + ": nothing of it written when the last place is not as expected");
+}
+
+/// The library's step of a build, made to take a long time step in two halves: one run of
+/// code at the start of the function the title's own step calls, which calls the library's
+/// tasks' begin, its step in so many parts, and leaves through its tasks' end. Where the image
+/// has those functions (made-up images hold nothing there), they are what they are taken for.
+static void CheckPhysicsSubsteps(const Build& build, std::vector<u8> image,
+                                 const std::string& name) {
+    const auto changes = PhysicsSubstepChanges(build);
+    bool in_a_row = !changes.empty();
+    u64 bytes = 0;
+    for (const Change& change : changes) {
+        in_a_row &= change.bytes == 8 && change.at == changes[0].at + bytes;
+        bytes += change.bytes;
+    }
+    Check(in_a_row && bytes == 96, name + ": the half steps are 96 bytes in a row");
+    const u64 from = changes[0].at;
+    // It replaces the start of the function the title's step calls or jumps to.
+    std::vector<u8> stepped = image;
+    const auto step = PhysicsStepChanges(build);
+    u64 step_bytes = 0;
+    for (const Change& change : step) {
+        step_bytes += change.bytes;
+    }
+    Check(Apply(stepped, step) == nullptr &&
+              CallTarget(std::span<const u8>{stepped.data() + step[0].at, step_bytes},
+                         step[0].at) == from,
+          name + ": they start the function the title's step calls");
+    const std::vector<u8> before{image.begin() + from, image.begin() + from + bytes};
+    Check(Apply(image, changes) == nullptr, name + ": the half steps are written");
+    const std::span<const u8> after{image.data() + from, bytes};
+    // Two calls and a jump out, in that order.
+    std::vector<u64> calls;
+    u64 leaves_to = 0;
+    for (size_t i = 0; i + 5 <= after.size();) {
+        s32 distance = 0;
+        std::memcpy(&distance, after.data() + i + 1, sizeof(distance));
+        if (after[i] == 0xe8) {
+            calls.push_back(from + i + 5 + distance);
+            i += 5;
+        } else if (after[i] == 0xe9 && calls.size() == 2) {
+            leaves_to = from + i + 5 + distance;
+            break;
+        } else {
+            ++i;
+        }
+    }
+    Check(calls.size() == 2 && leaves_to != 0, name + ": two calls and a jump out");
+    if (calls.size() == 2 && leaves_to != 0) {
+        Check(leaves_to == calls[0] + 0x20 && calls[1] > from && calls[1] < from + 0x1000,
+              name + ": to the tasks' begin, the step in parts just after, the tasks' end");
+        // The time step that is too long for one go, as the float the code compares with.
+        u32 longest = 0;
+        std::memcpy(&longest, &LongestWholeStep, sizeof(longest));
+        static constexpr std::array<u8, 3> Compare{0x41, 0x81, 0xfc};
+        const auto compare = std::search(after.begin(), after.end(), Compare.begin(), Compare.end());
+        u32 compared = 0;
+        if (after.end() - compare >= 7) {
+            std::memcpy(&compared, &*compare + 3, sizeof(compared));
+        }
+        Check(compared == longest, name + ": a time step above LongestWholeStep is halved");
+        const auto holds = [&](u64 at, std::initializer_list<u8> code) {
+            return at + code.size() <= image.size() &&
+                   std::equal(code.begin(), code.end(), image.begin() + at);
+        };
+        if (image[calls[0]] != 0) {
+            // mov rdi, [rdi+0xf88]; test rdi, rdi; je; mov rax, [rdi]; jmp [rax+0x10] / [rax+0x18]
+            Check(holds(calls[0], {0x48, 0x8b, 0xbf, 0x88, 0x0f, 0x00, 0x00}) &&
+                      holds(calls[0] + 15, {0xff, 0x60, 0x10}) &&
+                      holds(leaves_to, {0x48, 0x8b, 0xbf, 0x88, 0x0f, 0x00, 0x00}) &&
+                      holds(leaves_to + 15, {0xff, 0x60, 0x18}),
+                  name + ": the tasks' begin and end are those");
+            // push rbp; mov rbp, rsp; ... mov [rbp-0x10c], esi: how many parts it is to take.
+            static constexpr std::array<u8, 6> Parts{0x89, 0xb5, 0xf4, 0xfe, 0xff, 0xff};
+            const auto start = image.begin() + calls[1];
+            Check(holds(calls[1], {0x55, 0x48, 0x89, 0xe5}) &&
+                      std::search(start, start + 0x30, Parts.begin(), Parts.end()) != start + 0x30,
+                  name + ": the step in parts takes their number");
+        }
+    }
+    Check(Apply(image, changes) != nullptr, name + ": not written a second time");
+    std::vector<u8> odd{image};
+    std::memcpy(odd.data() + from, before.data(), bytes);
+    odd[changes.back().at] ^= 1;
+    const std::vector<u8> untouched = odd;
+    Check(Apply(odd, changes) == &changes.back() && odd == untouched,
+          name + ": nothing of them written when the last place is not as expected");
+}
+
+/// The hero's lead on a moving target: 16 bytes that multiplied the target's way since the
+/// frame before (xmm8) by 60 and by the flight's time (xmm9), and are to divide it by the
+/// engine's seconds a frame instead. Run here as the processor runs them, with a time of a
+/// frame of its own beside them: the lead is to be way / seconds a frame x time.
+static void CheckThrowLead(const Build& build, std::vector<u8> image, const std::string& name) {
+    const auto changes = ThrowLeadChanges(build);
+    Check(changes.size() == 2 && changes[0].bytes == 8 && changes[1].bytes == 8 &&
+              changes[1].at == changes[0].at + 8,
+          name + ": the throw's lead is 16 bytes in a row");
+    const u64 from = changes[0].at;
+    // vmulps xmm0, xmm8, [rip+...]: 60 four times.
+    static constexpr std::array<u8, 4> Times{0xc5, 0xb8, 0x59, 0x05};
+    s32 distance = 0;
+    std::memcpy(&distance, image.data() + from + 4, sizeof(distance));
+    std::array<float, 4> sixty{};
+    std::memcpy(sixty.data(), image.data() + from + 8 + distance, sizeof(sixty));
+    Check(std::equal(Times.begin(), Times.end(), image.begin() + from) &&
+              sixty == std::array<float, 4>{60.0f, 60.0f, 60.0f, 60.0f},
+          name + ": it multiplied the way a frame by 60");
+    Check(Apply(image, changes) == nullptr, name + ": the throw's lead is written");
+    // vdivss xmm1, xmm9, [rip+...]: the engine's seconds a frame.
+    static constexpr std::array<u8, 4> Over{0xc5, 0xb2, 0x5e, 0x0d};
+    std::memcpy(&distance, image.data() + from + 4, sizeof(distance));
+    Check(std::equal(Over.begin(), Over.end(), image.begin() + from) &&
+              from + 8 + distance == build.frame_seconds,
+          name + ": it divides by the engine's seconds a frame");
+#if defined(_WIN32) && defined(__x86_64__)
+    // sub rsp, 0x28; vmovups [rsp], xmm8; vmovups [rsp+0x10], xmm9; vmovups xmm8, [rcx];
+    // vmovss xmm9, [rdx]; <the 18 bytes of the lead>; vmovups [r8], xmm0; vmovups xmm8, [rsp];
+    // vmovups xmm9, [rsp+0x10]; add rsp, 0x28; ret; and at 64 the seconds a frame.
+    static constexpr std::array<u8, 23> Before{0x48, 0x83, 0xec, 0x28, 0xc5, 0x78, 0x11, 0x04,
+                                               0x24, 0xc5, 0x78, 0x11, 0x4c, 0x24, 0x10, 0xc5,
+                                               0x78, 0x10, 0x01, 0xc5, 0x7a, 0x10, 0x0a};
+    static constexpr std::array<u8, 21> After{0xc4, 0xc1, 0x78, 0x11, 0x00, 0xc5, 0x78,
+                                              0x10, 0x04, 0x24, 0xc5, 0x78, 0x10, 0x4c,
+                                              0x24, 0x10, 0x48, 0x83, 0xc4, 0x28, 0xc3};
+    auto* const code = static_cast<u8*>(VirtualAlloc(nullptr, 4096, 0x3000, 0x40));
+    bool right = code != nullptr;
+    if (code != nullptr) {
+        std::memcpy(code, Before.data(), Before.size());
+        std::memcpy(code + 23, image.data() + from, 18);
+        const s32 to_seconds = 64 - (23 + 8);
+        std::memcpy(code + 23 + 4, &to_seconds, sizeof(to_seconds));
+        std::memcpy(code + 41, After.data(), After.size());
+        const auto lead = reinterpret_cast<void (*)(const float*, const float*, float*)>(code);
+        // A target that goes 6 units a second, seen at 30, 60 and 120 frames a second, and a
+        // flight of half a second: 3 units ahead every time.
+        for (const float seconds : {1.0f / 30.0f, 1.0f / 60.0f, 1.0f / 120.0f}) {
+            std::memcpy(code + 64, &seconds, sizeof(seconds));
+            const float way[4]{6.0f * seconds, -3.0f * seconds, 0.0f, 0.0f};
+            const float time = 0.5f;
+            float ahead[4]{};
+            lead(way, &time, ahead);
+            right &= std::abs(ahead[0] - 3.0f) < 1e-4f && std::abs(ahead[1] + 1.5f) < 1e-4f &&
+                     ahead[2] == 0.0f;
+        }
+        VirtualFree(code, 0, 0x8000);
+    }
+    Check(right, name + ": run, it leads by speed x time at 30, 60 and 120 frames a second");
+#endif
+    Check(Apply(image, changes) != nullptr, name + ": not written a second time");
 }
 
 /// Twice the console's sizes, as the emulator works them out for a width of 2880.
@@ -265,6 +440,8 @@ int main(int argc, char** argv) {
         Check(Apply(image, beyond) == &beyond[0], name + ": nothing written beyond the image");
 
         CheckPhysicsStep(build, image, name);
+        CheckPhysicsSubsteps(build, image, name);
+        CheckThrowLead(build, image, name);
         CheckFrameCounts(build, image, name);
         // What the game is told apart by does not depend on it.
         std::vector<u8> stepped = image;
@@ -293,6 +470,8 @@ int main(int argc, char** argv) {
             Check(Apply(larger, SizeChanges(*build, Doubled())) == nullptr,
                   std::string{"larger sizes written into "} + argv[i]);
             CheckPhysicsStep(*build, image, argv[i]);
+            CheckPhysicsSubsteps(*build, image, argv[i]);
+            CheckThrowLead(*build, image, argv[i]);
             CheckFrameCounts(*build, image, argv[i]);
         }
     }

@@ -388,6 +388,48 @@ whose own touchpad the game is given, R1 now also swipes forward once (issue #43
 stars of the last boss want faster swipes than a thumb makes on the pad. A finger on the pad
 comes first. (The rest of 0.23 is the PC's: see `README-PC-VR.md`.)
 
+**App 0.24 (2026-11-14): the game from the headset's shared storage** (issue #44). The two places the app
+looked for the game in, its own folder under `Android/data` and `/data/local/tmp/astro/games`,
+both need adb, and a reporter with a Quest 3S could reach neither. The app now also looks in
+the shared storage, which a computer's file explorer shows with the headset on its cable: in
+a folder named `AstroQuest` first, then `Download` and `Documents`, then the rest (not in
+`Android`), up to three folders down in each. Android lets an app read other files than
+pictures, sound and video there only with "access to all files"
+(`MANAGE_EXTERNAL_STORAGE`), which the player switches on in a system screen: when the app
+finds no game, its panel says where to copy it, and A (✕ on a gamepad) opens that screen;
+back in the app, or at another press, it looks again without being started anew. The search
+in the two old places goes as deep, so a `CUSA12392` copied into a `CUSA12392`, or the
+game's files copied without their folder, are found. A `.pkg` lying where the game should be
+is said to be one. host.log has `game: <where it was found>`, or
+`no game found (shared storage looked through / not allowed)`.
+
+**App 0.24 (2026-11-14): what Astro throws no longer flies through its target** (issue #42: the robot on
+the wing of the plane in 1-2 could hardly be freed, and the boards before it were hard to hit).
+The game learns of a hit by asking its physics, after each step, what the thrown thing
+touches; the physics look for that once a step, where things are at its start. On the console
+a step is a sixtieth of a second. At the app's 30 frames a second it was a thirtieth, in
+which a thing thrown at 15 units a second moves half a unit: more than a board is thick, so
+it could be before the board at one look and behind it at the next. Time steps of more than
+23.5 ms are now taken in two halves, by a routine of the physics library itself that keeps
+what touched in either half (`known_title_builds.h`, `PhysicsSubstepChanges`;
+`SHADPS4_TITLE_PHYSICS_SUBSTEPS=0` in `env=` turns it off, `SHADPS4_TITLE_PHYSICS_WATCH=1`
+logs how many steps were halved). Tried on the PC held to 30 frames a second through the
+first level with both versions of the game (every step halved, moving platforms land where
+they are sent, nothing changes at 60), and started on the headset without wearing it. Worn,
+the boards that stand still are hit again. What the second half costs the headset's
+processor is not measured.
+
+The board on the plane moves, and that was a second thing: Astro aims a throw ahead of a
+moving target, at where it will be when the throw arrives. The game works that out as the way
+the target went since the frame before x 60 x the flight's time, which is the target's speed
+only where a frame is a sixtieth of a second. At 30 frames a second the throw was aimed twice
+as far ahead as the plane gets, and passed some 3 units in front of it. The way a frame is
+now divided by what the frame took (`ThrowLeadChanges`, 16 bytes, both versions of the game;
+`SHADPS4_TITLE_THROW_LEAD=0` turns it off): the same on the console, and right at any frame
+rate, on the PC above 60 as well. Checked by running the changed code with made-up values
+at 30, 60 and 120 frames a second (`tools/tests/known_title_builds_test.cpp`); **not yet
+tried at the wing itself**.
+
 **App 0.8 (2026-10-03)**, after the fourth session (levels 1-1 to 1-3 played, the game stopped
 on entering 1-4 twice):
 

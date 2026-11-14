@@ -85,14 +85,25 @@ Download `AstroQuest-<version>-Quest3.apk` from the
 
    (or drag the APK onto SideQuest).
 2. **Copy the game to the headset**, the folder named `CUSA12392` (`CUSA12431` for the
-   American release; this takes a few minutes):
+   American release; this takes a few minutes). Either way works:
 
-   ```sh
-   adb push CUSA12392 /data/local/tmp/astro/games/
-   ```
+   - **With the computer's file explorer** (from app 0.24 on): with the headset on its cable,
+     allow the connection in the headset, open it on the computer ("Internal shared
+     storage"), make a folder named `AstroQuest` there and copy `CUSA12392` into it. The
+     first time the app finds no game, it says so: press A (✕ on a gamepad) and switch on
+     "Allow access to all files" for it in the screen the headset then shows, and go back to
+     the app. It looks in `AstroQuest` first, then in the rest of the storage.
+   - **With adb**:
 
-   The app also finds it in `/sdcard/Android/data/com.astrobotquest.vrhost/files/games/CUSA12392`,
-   but that folder is deleted with the app if it is ever uninstalled.
+     ```sh
+     adb push CUSA12392 /data/local/tmp/astro/games/
+     ```
+
+     The app also finds it in `/sdcard/Android/data/com.astrobotquest.vrhost/files/games/CUSA12392`,
+     but that folder is deleted with the app if it is ever uninstalled.
+
+   The folder may sit one or two folders deeper than that (a `CUSA12392` inside a
+   `CUSA12392` is found too).
 
    **If your game is a `.pkg` file**, unpack it on a PC first: the headset needs the game's
    folder. Two ways:
@@ -169,7 +180,9 @@ folder off the headset first (`adb pull`).
 **Removing it all.** Uninstalling the app does not remove a game copied to
 `/data/local/tmp/astro/games`: that folder is not the app's, and the headset's file manager
 does not show it. `adb shell rm -rf /data/local/tmp/astro` deletes it (about 13 GB). A game in
-`/sdcard/Android/data/com.astrobotquest.vrhost/files/games` goes with the app.
+`/sdcard/Android/data/com.astrobotquest.vrhost/files/games` goes with the app. A game copied
+into the shared storage (the `AstroQuest` folder) stays until you delete that folder, with the
+headset's file manager or the computer's.
 
 ## Installing: PC VR through Virtual Desktop
 

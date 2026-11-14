@@ -1082,6 +1082,37 @@ $log = Join-Path $logDir "shad_log.txt"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 if (Test-Path $log) { Copy-Item $log (Join-Path $logDir "shad_log.prev.txt") -Force }
 
+# What Windows wrote down about a program that ended by a fault since a moment: the part of it
+# (or of the graphics driver, or of the headset's software) the fault happened in. When Windows
+# ends a program on the spot (code -1073740791, a failed check inside some part), nothing the
+# emulator writes itself can say that. Windows writes its record a moment after the end.
+function Get-CrashRecord([string]$program, [datetime]$since, [int]$tries = 8) {
+    for ($try = 0; $try -lt $tries; $try++) {
+        $records = @()
+        try {
+            $records = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = $since } -ErrorAction Stop)
+        } catch { }
+        foreach ($record in $records) {
+            $fields = $record.Properties
+            if ($fields.Count -ge 8 -and "$($fields[0].Value)" -ieq $program) {
+                return [pscustomobject]@{
+                    Module = "$($fields[3].Value)"; ModuleVersion = "$($fields[4].Value)"
+                    Code = "$($fields[6].Value)"; Offset = "$($fields[7].Value)"
+                }
+            }
+        }
+        if ($try + 1 -lt $tries) { Start-Sleep -Milliseconds 500 }
+    }
+    return $null
+}
+
+# The record, as a line for the player and for whoever reads a report.
+function Format-CrashRecord($record) {
+    if ($null -eq $record) { return "" }
+    return ("Windows recorded where it stopped: in " + $record.Module + " (version " + $record.ModuleVersion +
+        "), at " + $record.Offset + ", with code " + $record.Code + ".")
+}
+
 # (In this console, with what it prints kept out of the way: a window style given here would
 # also be the game window's.)
 $startedAt = Get-Date
@@ -1162,6 +1193,20 @@ if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
     }
     if ($memoryShort -and ((Get-Date) - $startedAt).TotalSeconds -lt 30) {
         Say "It stopped as it started, and Windows was short of memory then (see above): close other programs and start again."
+    }
+    # Kept beside the log, so that it comes along when the log is sent to somebody.
+    $crashNote = Join-Path $logDir "windows-error.txt"
+    [System.IO.File]::Delete($crashNote)
+    # (An end the emulator saw to itself, with a message in its log, leaves no record: not
+    # worth waiting four seconds for.)
+    $record = Get-CrashRecord "shadps4.exe" $startedAt $(if ($shown.Count -gt 0) { 2 } else { 8 })
+    if ($null -ne $record) {
+        $line = Format-CrashRecord $record
+        Say $line "Yellow"
+        try { [System.IO.File]::WriteAllText($crashNote, "The emulator ended with code " + $process.ExitCode + ". " + $line + "`r`n") } catch { }
+        Say "If you report this, attach windows-error.txt from the log's folder along with the log."
+    } elseif ($process.ExitCode -eq -1073740791 -and $shown.Count -eq 0) {
+        Say "Windows ended it on a failed check inside one of its parts (the emulator's own, the graphics driver's or the headset software's) and kept no record of which."
     }
     Read-Host "Press Enter to close"
 } else {

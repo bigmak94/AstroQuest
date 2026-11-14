@@ -336,6 +336,12 @@ Check "Menu saves stereo again" (Get-DesktopView) "stereo"
 Check "Menu saves Windows' language again" (Setting "language") "windows"
 Check "Menu saves uncropped image again" (Setting "desktop_crop") "0"
 
+# What Windows recorded about a fault (issue #46): none for a program that never ran, and the
+# line made of a record.
+Check "No record of a program that never ran" ($null -eq (Get-CrashRecord "no-such-program-aq.exe" (Get-Date).AddMinutes(-5) 1)) $true
+Check "A record as a line" (Format-CrashRecord ([pscustomobject]@{ Module = "some.dll"; ModuleVersion = "1.2.3.4"; Code = "c0000409"; Offset = "0002da71" })) "Windows recorded where it stopped: in some.dll (version 1.2.3.4), at 0002da71, with code c0000409."
+Check "No record, no line" (Format-CrashRecord $null) ""
+
 [System.IO.Directory]::Delete($base, $true)
 "failed: $failed"
 if ($failed -gt 0) { exit 1 }

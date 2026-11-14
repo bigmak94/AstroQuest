@@ -61,6 +61,11 @@ constexpr u64 InnerLibrary = 0x20;
 constexpr u64 LibraryBodyCount = 0x1a0; // u32
 constexpr u64 LibraryBodies = 0x1a8;    // pointer
 constexpr u64 LibraryTimeStep = 0x2760; // float
+constexpr u64 LibrarySteps = 0x27ac;    // u32: the steps taken so far
+// What touched what in the last step, for the title to ask: how many pairs, and the most
+// there is room for.
+constexpr u64 LibraryPairs = 0x27f0;     // u32
+constexpr u64 LibraryMostPairs = 0x348;  // u32
 // One body's state.
 constexpr u64 BodySize = 0xa0;
 constexpr u64 BodyMotion = 0x1;    // u8
@@ -69,6 +74,8 @@ constexpr u64 BodyPosition = 0x40; // float [3]
 constexpr u64 BodyVelocity = 0x60; // float [3]
 // A body that is moved by hand: sent to a place, which it reaches with the next step.
 constexpr u8 MotionKeyframe = 2;
+// A body that the library moves: it falls, bounces, is thrown.
+constexpr u8 MotionActive = 1;
 } // namespace Physics
 
 struct Build {
@@ -105,6 +112,9 @@ struct Build {
     /// The end of the function that has that world take a step (PhysicsStepChanges); places
     /// of no bytes fill the list up.
     std::array<Change, 4> physics_step;
+    /// The start of the library's function that takes a step, made to take a long one in two
+    /// halves (PhysicsSubstepChanges).
+    std::array<Change, 12> physics_substeps;
     /// The soccer robots' update (MupSoccerEnemy, in 2-2 and two other levels) counts how long
     /// they stay in each state in the console's frames, from soccer_enemies.xml, and makes
     /// seconds of them with the time step it is given. With a shorter step than the console's
@@ -114,6 +124,9 @@ struct Build {
     /// own instead, 1/60 s (FrameCountChanges). The one place that takes the step for the time
     /// that passed is left as it is.
     std::array<Change, 6> frame_counts;
+    /// Where the hero's throw works out how far ahead of a moving target to aim
+    /// (ThrowLeadChanges).
+    std::array<Change, 2> throw_lead;
 };
 
 inline constexpr std::array<Build, 2> Known{{
@@ -145,6 +158,25 @@ inline constexpr std::array<Build, 2> Known{{
                           {0xc2dea8, 0x0449bfe900002760, 0x000449c0e8575750, 8},
                           {0xc2deb0, 0x9090909090909000, 0x0027608789585f5f, 8},
                           {0xc2deb8, 0x9090909090909090, 0x909090909090c300, 8}}},
+        // The library's step (0xc72870) becomes, with its world in rdi:
+        //   push rbx; push r12; push rax; mov rbx, rdi; mov r12d, [rbx+0x2760];
+        //   lea rdi, [rbx+0x360]; call <tasks begin, 0xd4cfb0>; mov esi, 1;
+        //   cmp r12d, <0.0235f>; jle +18; sub dword [rbx+0x2760], 0x800000; inc esi;
+        //   inc dword [rbx+0x27ac]; mov rdi, rbx; call <steps in so many parts, 0xc731f0>;
+        //   mov [rbx+0x2760], r12d; lea rdi, [rbx+0x360]; pop rax; pop r12; pop rbx;
+        //   jmp <tasks end, 0xd4cfd0>
+        .physics_substeps = {{{0xc72870, 0x56415741e5894855, 0x44fb894850544153, 8},
+                              {0xc72878, 0x00e0ec8148535441, 0x8d4800002760a38b, 8},
+                              {0xc72880, 0x9e65c73d8b4c0000, 0xa726e800000360bb, 8},
+                              {0xc72888, 0x24b48d4dfc894900, 0x4100000001be000d, 8},
+                              {0xc72890, 0x49f7894c00000360, 0x127e3cc08312fc81, 8},
+                              {0xc72898, 0x0de8d8458948078b, 0x000000002760ab81, 8},
+                              {0xc728a0, 0xd5e8e7894c000da7, 0x27ac83ffc6ff0080, 8},
+                              {0xc728a8, 0xdde8e7894cfffff4, 0x093ee8df89480000, 8},
+                              {0xc728b0, 0x75e8e7894cfffff5, 0x002760a389440000, 8},
+                              {0xc728b8, 0x802484f641fffffc, 0x00000360bb8d4800, 8},
+                              {0xc728c0, 0xc741347402000027, 0x0da707e95b5c4158, 8},
+                              {0xc728c8, 0x0000000027f02484, 0xcccccccccccccc00, 8}}},
         // vmovss xmm0, [rbp-0x2598] / vmulss xmm2, xmm2 (or xmm6), [rbp-0x2598] become the
         // same from [rip+...]: the float 1/60 at 0x10d1694 (read-only).
         .frame_counts = {{{0x843133, 0xffffda688510fac5, 0x0088e5590510fac5, 8},
@@ -153,6 +185,13 @@ inline constexpr std::array<Build, 2> Known{{
                           {0x8439d1, 0xffffda689559eac5, 0x0088dcbb1559eac5, 8},
                           {0x843a01, 0xffffda689559cac5, 0x0088dc8b1559cac5, 8},
                           {0x843a2b, 0xffffda689559eac5, 0x0088dc611559eac5, 8}}},
+        // vmulps xmm0, xmm8, [rip+...] (60 four times); vpermilps xmm1, xmm9, 0;
+        // vmulps xmm0, xmm0, xmm1
+        // becomes
+        // vdivss xmm1, xmm9, [rip+...] (the engine's seconds a frame, 0x16688b0);
+        // vpermilps xmm1, xmm1, 0; vmulps xmm0, xmm8, xmm1
+        .throw_lead = {{{0x933f30, 0x008cd8080559b8c5, 0x00d349780d5eb2c5, 8},
+                        {0x933f38, 0xf8c500c90479c3c4, 0xb8c500c90479e3c4, 8}}},
     },
     {
         .name = "1.04, the last update",
@@ -183,6 +222,20 @@ inline constexpr std::array<Build, 2> Known{{
                           {0xcb09d7, 0x5cefe80000276087, 0x27608789207f8b49, 8},
                           {0xcb09df, 0x0004, 0x0000, 2},
                           {0, 0, 0, 0}}},
+        // The same code as in 1.00, at 0xcf66d0: tasks begin 0xdd04d0, steps in so many
+        // parts 0xcf7050, tasks end 0xdd04f0.
+        .physics_substeps = {{{0xcf66d0, 0x56415741e5894855, 0x44fb894850544153, 8},
+                              {0xcf66d8, 0x00e0ec8148535441, 0x8d4800002760a38b, 8},
+                              {0xcf66e0, 0xa194073d8b4c0000, 0x9de6e800000360bb, 8},
+                              {0xcf66e8, 0x24b48d4dfc894900, 0x4100000001be000d, 8},
+                              {0xcf66f0, 0x49f7894c00000360, 0x127e3cc08312fc81, 8},
+                              {0xcf66f8, 0xcde8d8458948078b, 0x000000002760ab81, 8},
+                              {0xcf6700, 0xd5e8e7894c000d9d, 0x27ac83ffc6ff0080, 8},
+                              {0xcf6708, 0xdde8e7894cfffff4, 0x093ee8df89480000, 8},
+                              {0xcf6710, 0x75e8e7894cfffff5, 0x002760a389440000, 8},
+                              {0xcf6718, 0x802484f641fffffc, 0x00000360bb8d4800, 8},
+                              {0xcf6720, 0xc741347402000027, 0x0d9dc7e95b5c4158, 8},
+                              {0xcf6728, 0x0000000027f02484, 0xcccccccccccccc00, 8}}},
         // The same with [rbp-0x26f8]; the float 1/60 at 0x115bfb4.
         .frame_counts = {{{0x8a1563, 0xffffd9088510fac5, 0x008baa490510fac5, 8},
                           {0x8a1700, 0xffffd9089559eac5, 0x008ba8ac1559eac5, 8},
@@ -190,6 +243,9 @@ inline constexpr std::array<Build, 2> Known{{
                           {0x8a1dd9, 0xffffd9089559eac5, 0x008ba1d31559eac5, 8},
                           {0x8a1e09, 0xffffd9089559cac5, 0x008ba1a31559cac5, 8},
                           {0x8a1e33, 0xffffd9089559eac5, 0x008ba1791559eac5, 8}}},
+        // The same at 0x996cf0, the engine's seconds a frame at 0x17208c0.
+        .throw_lead = {{{0x996cf0, 0x008fd6d80559b8c5, 0x00d89bc80d5eb2c5, 8},
+                        {0x996cf8, 0xf8c500c90479c3c4, 0xb8c500c90479e3c4, 8}}},
     },
 }};
 
@@ -260,9 +316,62 @@ inline std::vector<Change> PhysicsStepChanges(const Build& build) {
     return changes;
 }
 
+/// The longest time step the title's physics take in one go, in seconds: a longer one is taken
+/// in two halves (PhysicsSubstepChanges). Between the steps of 45 frames a second and of 40.
+inline constexpr float LongestWholeStep = 0.0235f;
+
+/// What has the title's physics take a long time step in two halves.
+///
+/// The library looks for what touches what once a step, where things are at its start, and
+/// then moves them by speed x time step. The console's step is a sixtieth of a second. With a
+/// time step that follows the frames, a title held to 30 frames a second (the Quest) moves
+/// everything twice as far between two looks: a ball thrown at 15 units a second is half a
+/// unit on, and what it was thrown at is thinner than that. It goes through the target without
+/// ever having touched it, which is how the board on the wing of the plane in 1-2 could hardly
+/// be hit (issue #42); the title learns of a hit by asking, after the step, what the ball
+/// touches.
+///
+/// The library has a second way to take a step, which the title never calls: so many steps in
+/// a row, each with the time step that is written down, and what touched in any of them is in
+/// the lists the title asks afterwards (a pair that touched in an earlier part stays in them).
+/// The function that takes the one step is rewritten to call that: with one part where the time
+/// step written down is at most LongestWholeStep, which is the step as it was, and otherwise
+/// with two parts of half the time step each (halved by taking one off the float's exponent,
+/// and put back after). Bodies that are sent somewhere still arrive: their speed is distance /
+/// time step, and two halves of the time step take them as far as the whole. The library's
+/// count of steps goes up by two for a step in two halves, which is how the emulator can tell
+/// (PhysicsWatch).
+///
+/// The same code in both builds; the rest of the function it starts is no longer reached.
+inline std::vector<Change> PhysicsSubstepChanges(const Build& build) {
+    return {build.physics_substeps.begin(), build.physics_substeps.end()};
+}
+
 /// The soccer robots' frame counts made seconds of at the console's frame (Build::frame_counts).
 inline std::vector<Change> FrameCountChanges(const Build& build) {
     return {build.frame_counts.begin(), build.frame_counts.end()};
+}
+
+/// What has the hero aim a thrown thing ahead of a moving target by the target's speed, however
+/// long a frame is.
+///
+/// What the hero throws (a ball, a block) flies at a set speed to where its target will be:
+/// the title takes the flight's time, distance / speed, and aims at the target's place plus
+/// the way the target went since the frame before x 60 x that time. The 60 makes a speed of a
+/// way a frame, and is right on the console only. With a time step that follows the frames,
+/// a target moves twice as far in a frame of a thirtieth of a second: the throw aims twice as
+/// far ahead as the target gets, and passes in front of it by speed x time (the plane of 1-2
+/// goes at 5 to 7 units a second and is 0.5 s away: some 3 units, issue #42). With frames
+/// shorter than the console's it falls behind the same way. A target that stands still is hit
+/// either way, which is how this stayed after the step in two halves (PhysicsSubstepChanges).
+///
+/// The change: the way a frame is divided by the engine's seconds a frame (Build::frame_seconds,
+/// what the title's clock is set with every frame) instead of multiplied by 60: the same on
+/// the console, where that is a sixtieth. In place, 16 bytes, the same code in both builds.
+/// (Left as it is: the title gives no lead at all to a target that went 0.5 or more in a
+/// frame, which is 15 units a second at 30 frames a second and 30 on the console.)
+inline std::vector<Change> ThrowLeadChanges(const Build& build) {
+    return {build.throw_lead.begin(), build.throw_lead.end()};
 }
 
 /// The first of some places that does not hold what the console's build has there (or lies

@@ -43,6 +43,13 @@
       to PlayStation VR's. Asked for when the app starts; without it the game hears silence.
     -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!--
+      The game's files may be in the headset's shared storage, where a computer's file
+      explorer can put them (the app's own folder and /data/local/tmp need adb). The app looks
+      there only once the player has switched this on for it, which it asks for when it finds
+      no game in the two other places.
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <!-- Development aid, see SandboxShell.java. -->
     <instrumentation

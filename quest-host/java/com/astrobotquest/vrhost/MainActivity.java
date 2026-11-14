@@ -3,6 +3,7 @@ package com.astrobotquest.vrhost;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -19,14 +20,17 @@ import android.hardware.lights.Light;
 import android.hardware.lights.LightState;
 import android.hardware.lights.LightsManager;
 import android.hardware.lights.LightsRequest;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.CombinedVibration;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.VibratorManager;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -55,7 +59,8 @@ import java.util.Locale;
  *
  * Files the user provides live in the app's external folder
  * (/sdcard/Android/data/com.astrobotquest.vrhost/files):
- *   games/SERIAL/eboot.bin ...   the extracted game (or /data/local/tmp/astro/games/SERIAL)
+ *   games/SERIAL/eboot.bin ...   the extracted game (or /data/local/tmp/astro/games/SERIAL, or
+ *                                 a folder of the headset's shared storage: see findGame)
  *   data/shadPS4/                 the emulator's own folder (sys_modules, saves, logs)
  *   vrhost.txt                    optional settings, see readSettings
  * and what the app leaves there for looking at afterwards:
@@ -77,6 +82,14 @@ public class MainActivity extends Activity
 
     /** Second place games are looked for; every app may read what adb puts there. */
     private static final String SHELL_GAMES = "/data/local/tmp/astro/games";
+    /**
+     * Third place: the headset's shared storage, which a computer's file explorer shows when
+     * the headset is on its cable (the two above need adb). These folders of it first, then
+     * the rest. The app may look there once the player has allowed it access to all files.
+     */
+    private static final String[] STORAGE_FIRST = {"AstroQuest", "Download", "Documents"};
+    /** How far below a place the game's folder may be, and how many folders are opened for it. */
+    private static final int GAME_DEPTH = 3, GAME_FOLDERS = 3000;
 
     // Mirrors CoreProcess::State.
     private static final int CORE_IDLE = 0, CORE_STARTING = 1, CORE_RUNNING = 2, CORE_STOPPED = 3,
@@ -188,6 +201,12 @@ public class MainActivity extends Activity
     private View inputView;
     private volatile String setupStatus = "Starting...";
     private volatile boolean setupFailed;
+    /** Setup stopped for want of a game: A (cross) looks again, after asking for the storage. */
+    private volatile boolean noGame;
+    /** The confirming button was let go since the game was last looked for. */
+    private boolean lookAgainArmed;
+    /** A package seen where the game was looked for: said, since it explains the empty hands. */
+    private volatile String packageSeen;
     private String shownStatus = "";
 
     // Controller state.
@@ -376,6 +395,11 @@ public class MainActivity extends Activity
             // Likewise the cards that say which buttons do the touchpad's gestures.
             drawStatus("The touchpad, on this controller", controlsCard(true));
             drawStatus("The touchpad, on this controller", controlsCard(false));
+            // And what is said when there is no game, before and after the storage is allowed.
+            drawStatus("Astro VR Host", noGameMessage(false));
+            packageSeen = "Game.pkg";
+            drawStatus("Astro VR Host", noGameMessage(true));
+            packageSeen = null;
             startGame();
         } else {
             handler.post(this::pollOwnControllers);
@@ -402,6 +426,15 @@ public class MainActivity extends Activity
             logInfo("microphone " + (grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED
                             ? "allowed" : "not allowed"));
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Back from the system's question about the storage, or from copying the game.
+        if (noGame && !dryRun) {
+            lookAgain(false);
         }
     }
 
@@ -750,16 +783,24 @@ public class MainActivity extends Activity
             File games = new File(external, "games");
             games.mkdirs();
             new File(external, "data/shadPS4/sys_modules").mkdirs();
+            packageSeen = null;
             File eboot = findGame(games);
             if (eboot == null) {
                 // Where "adb push" can put it without caring who owns the files.
                 eboot = findGame(new File(SHELL_GAMES));
             }
+            boolean mayLook = Environment.isExternalStorageManager();
+            if (eboot == null && mayLook) {
+                eboot = findGameInStorage(Environment.getExternalStorageDirectory());
+            }
             if (eboot == null) {
+                logInfo("no game found (shared storage " + (mayLook ? "looked through"
+                        : "not allowed") + (packageSeen != null ? ", a package seen: "
+                        + packageSeen : "") + ")");
+                setupStatus = noGameMessage(mayLook);
                 setupFailed = true;
-                setupStatus = "No game found.\n\nCopy the extracted game folder (the one that "
-                        + "contains eboot.bin) to the headset, to either of\n" + games
-                        + "/CUSA12392\n" + SHELL_GAMES + "/CUSA12392\nthen start this app again.";
+                noGame = true;
+                handler.post(this::pollLookAgain);
                 return;
             }
             String described = gameDescriptionProblem(eboot.getParentFile());
@@ -922,22 +963,141 @@ public class MainActivity extends Activity
                 + "description (it does not start with PSF)." + fix;
     }
 
-    /** The game to run: games/CUSA12392 if present, otherwise the first folder with an eboot. */
-    private static File findGame(File games) {
-        File preferred = new File(games, "CUSA12392/eboot.bin");
-        if (preferred.isFile()) {
-            return preferred;
+    /**
+     * The game to run under a place games are kept: CUSA12392 if present (CUSA12431, the
+     * American release), otherwise the first folder with an eboot.bin, the place itself
+     * included and up to GAME_DEPTH folders down: a folder copied into one of its own name, or
+     * its contents copied without it, are the usual slips. Folders named as an update of a game
+     * (-UPDATE, -patch, -mods) are not games: the emulator lays them over the game beside them.
+     */
+    private File findGame(File games) {
+        for (String serial : new String[] {"CUSA12392", "CUSA12431"}) {
+            File preferred = new File(games, serial + "/eboot.bin");
+            if (preferred.isFile()) {
+                return preferred;
+            }
         }
-        File[] folders = games.listFiles();
-        if (folders != null) {
-            for (File folder : folders) {
-                File eboot = new File(folder, "eboot.bin");
-                if (eboot.isFile()) {
+        List<File> level = new ArrayList<>();
+        level.add(games);
+        int opened = 0;
+        for (int depth = 0; depth <= GAME_DEPTH && !level.isEmpty(); depth++) {
+            List<File> next = new ArrayList<>();
+            for (File folder : level) {
+                if (new File(folder, "eboot.bin").isFile()) {
+                    return new File(folder, "eboot.bin");
+                }
+                File[] entries = ++opened > GAME_FOLDERS ? null : folder.listFiles();
+                if (entries == null) {
+                    continue;
+                }
+                Arrays.sort(entries);
+                for (File entry : entries) {
+                    String name = entry.getName();
+                    if (entry.isDirectory()) {
+                        String lower = name.toLowerCase(Locale.ROOT);
+                        if (!name.startsWith(".") && !lower.endsWith("-update")
+                                && !lower.endsWith("-patch") && !lower.endsWith("-mods")) {
+                            next.add(entry);
+                        }
+                    } else if (packageSeen == null
+                            && name.toLowerCase(Locale.ROOT).endsWith(".pkg")
+                            && entry.length() > (1L << 30)) {
+                        packageSeen = name;
+                    }
+                }
+            }
+            level = next;
+        }
+        return null;
+    }
+
+    /**
+     * The game in the headset's shared storage: in the folders a player would think of first,
+     * then anywhere else but in the apps' own folders (Android).
+     */
+    private File findGameInStorage(File storage) {
+        for (String name : STORAGE_FIRST) {
+            File eboot = findGame(new File(storage, name));
+            if (eboot != null) {
+                return eboot;
+            }
+        }
+        File[] entries = storage.listFiles();
+        if (entries == null) {
+            logInfo("the shared storage could not be listed: " + storage);
+            return null;
+        }
+        Arrays.sort(entries);
+        for (File entry : entries) {
+            String name = entry.getName();
+            if (entry.isDirectory() && !name.equals("Android") && !name.startsWith(".")
+                    && !Arrays.asList(STORAGE_FIRST).contains(name)) {
+                File eboot = findGame(entry);
+                if (eboot != null) {
                     return eboot;
                 }
             }
         }
         return null;
+    }
+
+    /** What the panel says when there is no game; storage: the app may look in the storage. */
+    private String noGameMessage(boolean storage) {
+        // (Nine lines of the panel at most.)
+        String found = packageSeen == null ? "No game found." : "The app found a package (.pkg), "
+                + "but it plays the unpacked game: the PC package's launcher unpacks it.";
+        return found + "\n\n"
+                + "With the headset on a computer's cable, copy the game's folder (CUSA12392, the "
+                + "one with eboot.bin in it) into a folder named AstroQuest in the headset's "
+                + "storage.\n\n"
+                + (storage ? "Then press A (cross on a gamepad) to look again."
+                        : "Then press A (cross on a gamepad), and allow this app access to all "
+                                + "files when the headset asks: it may not look there before.");
+    }
+
+    /**
+     * The player says the game is there now. Where the app may not look in the shared storage
+     * yet, they are asked for that first (asked: by a press, not by coming back to the app).
+     */
+    private void lookAgain(boolean asked) {
+        if (!noGame) {
+            return;
+        }
+        if (asked && !dryRun && !Environment.isExternalStorageManager()) {
+            logInfo("asking for access to the shared storage");
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (RuntimeException e) {
+                // No such screen for one app on this system: the list of all of them, then.
+                logWarning("no screen for this app's access to all files", e);
+                try {
+                    startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                } catch (RuntimeException e2) {
+                    logWarning("no screen for access to all files", e2);
+                }
+            }
+            return;
+        }
+        logInfo("looking for the game again");
+        noGame = false;
+        setupFailed = false;
+        setupStatus = "Looking for the game...";
+        new Thread(this::setUpAndStart, "setup").start();
+    }
+
+    /** A on the headset's own controllers (the native side reads them) looks again as well. */
+    private void pollLookAgain() {
+        if (!noGame || dryRun) {
+            return;
+        }
+        if ((nativeTouchMenu() & MENU_CONFIRM) == 0) {
+            lookAgainArmed = true;
+        } else if (lookAgainArmed) {
+            lookAgainArmed = false;
+            lookAgain(true);
+        }
+        handler.postDelayed(this::pollLookAgain, 50);
     }
 
     // --- status panel ---------------------------------------------------------------------------
@@ -1456,6 +1616,24 @@ public class MainActivity extends Activity
                             fovConfirmKey = event.getKeyCode();
                             startGame();
                         }
+                        break;
+                    case KeyEvent.KEYCODE_BACK:
+                        finish();
+                        break;
+                    default:
+                        break;
+                }
+            }
+            return true;
+        }
+        if (noGame) {
+            // Nothing is played yet: the confirming button looks for the game again.
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                switch (event.getKeyCode()) {
+                    case KeyEvent.KEYCODE_BUTTON_A:
+                    case KeyEvent.KEYCODE_DPAD_CENTER:
+                    case KeyEvent.KEYCODE_ENTER:
+                        lookAgain(true);
                         break;
                     case KeyEvent.KEYCODE_BACK:
                         finish();

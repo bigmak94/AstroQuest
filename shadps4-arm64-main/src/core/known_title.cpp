@@ -195,6 +195,11 @@ struct Settings {
     /// The title's physics take each step with the time step its bodies were sent with
     /// (Builds::PhysicsStepChanges): what a time step that changes needs.
     bool physics_step{true};
+    /// The title's physics take a long time step in two halves
+    /// (Builds::PhysicsSubstepChanges): what a title held to 30 frames a second needs.
+    bool physics_substeps{true};
+    /// The hero's throws lead a moving target by its speed (Builds::ThrowLeadChanges).
+    bool throw_lead{true};
     /// Where the bodies the title moves by hand end up goes to the log (PhysicsWatch).
     bool physics_watch{false};
 
@@ -263,6 +268,15 @@ const Settings& GetSettings() {
         }
         if (const char* value = std::getenv("SHADPS4_TITLE_PHYSICS_WATCH"); value != nullptr) {
             parsed.physics_watch = std::atoi(value) != 0;
+        }
+        // SHADPS4_TITLE_THROW_LEAD=0: the hero aims ahead of a moving target as the title has
+        // it, by the target's way a frame as if frames were the console's.
+        if (const char* value = std::getenv("SHADPS4_TITLE_THROW_LEAD"); value != nullptr) {
+            parsed.throw_lead = std::atoi(value) != 0;
+        }
+        // SHADPS4_TITLE_PHYSICS_SUBSTEPS=0: every time step taken in one go, however long.
+        if (const char* value = std::getenv("SHADPS4_TITLE_PHYSICS_SUBSTEPS"); value != nullptr) {
+            parsed.physics_substeps = std::atoi(value) != 0;
         }
         // SHADPS4_TITLE_LOD=<share>: the distances at which models change to their coarser
         // forms, as a share of the title's own (0.33 = a third); SHADPS4_TITLE_SHADOW_MAP=
@@ -1092,11 +1106,22 @@ public:
             return;
         }
         const u64 library = Read<u64>(inner + Physics::InnerLibrary);
-        if (!there(library, Physics::LibraryTimeStep + 4)) {
+        if (!there(library, Physics::LibraryPairs + 4)) {
             return;
         }
         const u32 count = Read<u32>(library + Physics::LibraryBodyCount);
         const u64 bodies = Read<u64>(library + Physics::LibraryBodies);
+        // The library counts its steps, and a step taken in two halves as two
+        // (Builds::PhysicsSubstepChanges): between two looks there is one step of the title's.
+        const u32 steps = Read<u32>(library + Physics::LibrarySteps);
+        if (library == seen_library && steps - seen_steps <= 2 && steps != seen_steps) {
+            ++title_steps;
+            halved_steps += steps - seen_steps == 2 ? 1 : 0;
+        }
+        seen_library = library;
+        seen_steps = steps;
+        most_pairs = std::max(most_pairs, Read<u32>(library + Physics::LibraryPairs));
+        room_for_pairs = Read<u32>(library + Physics::LibraryMostPairs);
         const double scale = Read<float>(inner + Physics::InnerScale);
         const double time_step = Read<float>(library + Physics::LibraryTimeStep);
         if (count == 0 || count > MostBodies || !there(bodies, count * Physics::BodySize) ||
@@ -1147,6 +1172,7 @@ public:
             was.segment = segment;
             was.position = position;
         }
+        WatchThrows(bodies, count, scale, time_step);
         if (stepped && written_down > 0.0) {
             // How unlike two time steps in a row are, which is what the bodies are off by.
             most_unlike = std::max(most_unlike, std::abs(time_step / written_down - 1.0));
@@ -1157,15 +1183,20 @@ public:
     /// What was seen since this was last asked, "" for nothing.
     std::string TakeSummary() {
         std::scoped_lock lock{mutex};
-        if (moves == 0) {
+        if (moves == 0 && title_steps == 0) {
             return {};
         }
         std::string summary = fmt::format(
             "The title's bodies: {} times one was sent somewhere and moved, {:.2f} at the "
             "farthest; where they ended was {:.4f} from where they were sent at worst (by one "
             "sent {:.2f}), {} times more than {} away; two time steps in a row were {:.1f}% "
-            "apart at most",
-            moves, farthest, worst_off, worst_way, missed, Off, most_unlike * 100.0);
+            "apart at most; {} of {} steps were taken in two halves; {} pairs touched at most "
+            "(room for {})",
+            moves, farthest, worst_off, worst_way, missed, Off, most_unlike * 100.0,
+            halved_steps, title_steps, most_pairs, room_for_pairs);
+        title_steps = 0;
+        halved_steps = 0;
+        most_pairs = 0;
         moves = 0;
         missed = 0;
         farthest = 0.0;
@@ -1176,6 +1207,108 @@ public:
     }
 
 private:
+    /// What is thrown at something that moves (the hero's ball at the plane of 1-2, issue #42):
+    /// a body that falls freely and is all at once as fast as a throw is followed until it
+    /// slows down or is gone, and how near it came to a body that is moved by hand and was
+    /// moving goes to the log, in the title's units. A throw that leads its target as it
+    /// should comes within the two bodies' sizes of it; one that leads it by a way a frame
+    /// taken for a sixtieth of a second passes it by the target's speed x the flight's time.
+    void WatchThrows(u64 bodies, u32 count, double scale, double time_step) {
+        namespace Physics = Builds::Physics;
+        static constexpr double Thrown = 10.0; // units a second: the hero throws at 15
+        static constexpr double Moving = 1.0;
+        const auto place = [&](u32 i) {
+            const auto at = Read<std::array<float, 3>>(bodies + u64{i} * Physics::BodySize +
+                                                       Physics::BodyPosition);
+            return std::array<double, 3>{at[0] / scale, at[1] / scale, at[2] / scale};
+        };
+        const auto speed = [&](u32 i) {
+            const auto v = Read<std::array<float, 3>>(bodies + u64{i} * Physics::BodySize +
+                                                      Physics::BodyVelocity);
+            return std::sqrt(double{v[0]} * v[0] + double{v[1]} * v[1] + double{v[2]} * v[2]) /
+                   scale;
+        };
+        const auto motion = [&](u32 i) {
+            return Read<u8>(bodies + u64{i} * Physics::BodySize + Physics::BodyMotion);
+        };
+        if (speeds.size() != count) {
+            speeds.assign(count, 0.0);
+            thrown.clear();
+        }
+        for (u32 i = 0; i < count; ++i) {
+            const double now = motion(i) == Physics::MotionActive ? speed(i) : 0.0;
+            if (now >= Thrown && speeds[i] < Thrown * 0.5 && thrown.size() < 8) {
+                thrown.push_back({.body = i, .off = now, .from = place(i)});
+            }
+            speeds[i] = now;
+        }
+        for (auto it = thrown.begin(); it != thrown.end();) {
+            Throw& one = *it;
+            const auto at = place(one.body);
+            ++one.looks;
+            one.seconds += time_step;
+            const bool over = motion(one.body) != Physics::MotionActive ||
+                              speeds[one.body] < Thrown * 0.5 || one.looks >= 180;
+            if (!over) {
+                for (u32 i = 0; i < count; ++i) {
+                    if (motion(i) != Physics::MotionKeyframe) {
+                        continue;
+                    }
+                    const double goes = speed(i);
+                    if (goes < Moving) {
+                        continue;
+                    }
+                    const auto other = place(i);
+                    const double apart = std::sqrt((at[0] - other[0]) * (at[0] - other[0]) +
+                                                   (at[1] - other[1]) * (at[1] - other[1]) +
+                                                   (at[2] - other[2]) * (at[2] - other[2]));
+                    if (apart < one.nearest) {
+                        one.nearest = apart;
+                        one.nearest_goes = goes;
+                        one.nearest_after = one.seconds;
+                        one.nearest_body = i;
+                    }
+                }
+                ++it;
+                continue;
+            }
+            const double way = std::sqrt((at[0] - one.from[0]) * (at[0] - one.from[0]) +
+                                         (at[1] - one.from[1]) * (at[1] - one.from[1]) +
+                                         (at[2] - one.from[2]) * (at[2] - one.from[2]));
+            if (one.nearest < 1e9) {
+                LOG_INFO(Core,
+                         "A thrown body (number {}) went off at {:.1f} a second from {:.2f} "
+                         "{:.2f} {:.2f}; it came within {:.2f} of a body that is moved by hand "
+                         "(number {}, going {:.1f} a second) {:.2f} s on, and was followed for "
+                         "{:.2f} s and {:.2f}",
+                         one.body, one.off, one.from[0], one.from[1], one.from[2], one.nearest,
+                         one.nearest_body, one.nearest_goes, one.nearest_after, one.seconds, way);
+            } else {
+                LOG_INFO(Core,
+                         "A thrown body (number {}) went off at {:.1f} a second from {:.2f} "
+                         "{:.2f} {:.2f}: nothing that is moved by hand was moving; followed for "
+                         "{:.2f} s and {:.2f}",
+                         one.body, one.off, one.from[0], one.from[1], one.from[2], one.seconds,
+                         way);
+            }
+            it = thrown.erase(it);
+        }
+    }
+
+    struct Throw {
+        u32 body{};
+        double off{};
+        std::array<double, 3> from{};
+        u32 looks{};
+        double seconds{};
+        double nearest{1e10};
+        double nearest_goes{};
+        double nearest_after{};
+        u32 nearest_body{};
+    };
+    std::vector<double> speeds;
+    std::vector<Throw> thrown;
+
     struct Seen {
         bool by_hand{};
         std::array<s32, 3> segment{};
@@ -1200,6 +1333,15 @@ private:
     double worst_off{};
     double worst_way{};
     double most_unlike{};
+    /// The library's world and its count of steps when last looked at, and what that count
+    /// said since the summary was last taken.
+    u64 seen_library{};
+    u32 seen_steps{};
+    u64 title_steps{};
+    u64 halved_steps{};
+    /// The most pairs the library had in its lists of what touches what, and its room for them.
+    u32 most_pairs{};
+    u32 room_for_pairs{};
 };
 
 PhysicsWatch physics_watch;
@@ -1449,6 +1591,21 @@ void OnGameLoaded(VAddr base, u64 size) {
         } else {
             LOG_INFO(Core, "The title's physics take every step with the time step its bodies "
                            "were sent with");
+            if (settings.physics_substeps) {
+                const auto halves = Builds::PhysicsSubstepChanges(*build);
+                if (const Builds::Change* odd = Builds::Apply(image, halves); odd != nullptr) {
+                    LOG_WARNING(Core,
+                                "The title does not have {:#x} at {:#x} as expected: its physics "
+                                "take a long time step in one go, and what is thrown may pass "
+                                "through what it is thrown at",
+                                odd->was, odd->at);
+                } else {
+                    LOG_INFO(Core,
+                             "The title's physics take a time step of more than {:.1f} ms in two "
+                             "halves",
+                             Builds::LongestWholeStep * 1e3);
+                }
+            }
         }
     }
     if (GetSettings().time_step) {
@@ -1464,6 +1621,20 @@ void OnGameLoaded(VAddr base, u64 size) {
                         unexpected->was, unexpected->at);
         } else {
             LOG_INFO(Core, "The title's soccer robots count their frames as the console's");
+        }
+    }
+    if (const Settings& settings = GetSettings(); settings.time_step && settings.throw_lead) {
+        const auto changes = Builds::ThrowLeadChanges(*build);
+        if (const Builds::Change* unexpected = Builds::Apply(image, changes);
+            unexpected != nullptr) {
+            LOG_WARNING(Core,
+                        "The title does not have {:#x} at {:#x} as expected: what its hero "
+                        "throws at a moving target is aimed as if frames were a sixtieth of a "
+                        "second, and misses it where they are not",
+                        unexpected->was, unexpected->at);
+        } else {
+            LOG_INFO(Core, "The title's hero aims ahead of a moving target by the target's "
+                           "speed, whatever a frame takes");
         }
     }
     known_base = base;

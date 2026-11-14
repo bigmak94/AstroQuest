@@ -487,6 +487,20 @@ Things that had to be right, for whoever works on this again:
   Every port plays on a device of its own, never on "the default device" as such (see
   "Fixed and added in 0.19").
 
+## Fixed and added in 0.24 (2026-11-14)
+
+- **When Windows ends the emulator on the spot** (code -1073740791, issue #46), the launcher
+  now says where. Windows does that when a check fails inside the emulator, the graphics
+  driver or the headset's software, and the emulator gets no chance to write the reason into
+  its own log. Windows keeps a record of the part it happened in: the launcher reads it,
+  shows it, and writes it to `pc-vr\user\log\windows-error.txt`, to attach to a report along
+  with `shad_log.txt`.
+- **The launcher under Proton** (issue #48): see "Linux, through Proton, as reported".
+- **At 40 frames a second and below, the game's physics take each time step in two halves**
+  (issue #42, found on the Quest; see "App 0.24" in `README-QUEST-VR.md`): what Astro throws
+  could pass through a thin target between two looks of the physics. Nothing changes at 45
+  frames a second and above.
+
 ## Fixed and added in 0.23 (2026-10-21)
 
 From [evertec82's fork](https://github.com/evertec82/AstroQuest) (issue #30), which players
@@ -715,6 +729,20 @@ script of one's own (Wine's OpenXR layer got in the way otherwise):
 
 Before 0.19 the first start also needed the "Save Migration" box answered on the desktop,
 or the headset's session timed out; that box no longer comes.
+
+**With the launcher** (queenbiscuit311, issue #48; tried by them with SteamVR through Steam
+Link on a Quest 3, with GE-Proton, Proton Experimental and proton-cachyos; not tried here).
+The launcher is a PowerShell script, and a Proton prefix has no PowerShell until it is given
+one. With Protontricks installed:
+
+1. Steam > Games > Add a Non-Steam Game > Browse, "File type" set to "All Files": choose
+   `Play Astro Bot VR.bat`. In its Properties > Compatibility, force GE-Proton or Proton
+   Experimental.
+2. Start it once: a console window comes and goes. That makes the prefix.
+3. Open Protontricks, choose the game just added (dismiss its warnings), "Select the default
+   wineprefix", "Install a Windows DLL or component", and tick `powershell` (not
+   `powershell_core`). Let its installer finish and close Protontricks.
+4. Start it again: the launcher's window comes, and its settings are kept as on Windows.
 
 ## Fixed and added on 2026-10-06, from the reports on GitHub
 
