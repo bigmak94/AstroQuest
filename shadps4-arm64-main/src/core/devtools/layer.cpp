@@ -13,6 +13,7 @@
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "imgui/imgui_std.h"
+#include "imgui/renderer/imgui_core.h"
 #include "imgui_internal.h"
 #include "options.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -238,7 +239,7 @@ void L::DrawAdvanced() {
             Options.disassembler_cli_isa = disassembler_cli_isa;
             Options.disassembler_cli_spv = disassembler_cli_spv;
             Options.frame_dump_render_on_collapse = frame_dump_render_on_collapse;
-            SaveIniSettingsToDisk(io.IniFilename);
+            ImGui::Core::SaveIniSettings();
             CloseCurrentPopup();
         }
         EndPopup();

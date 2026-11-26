@@ -171,6 +171,13 @@ public:
         return std::fread(data, sizeof(T), size, file);
     }
 
+    // Forgets a failed read or write, so that the next one is tried rather than refused.
+    void ClearError() const {
+        if (file != nullptr) {
+            std::clearerr(file);
+        }
+    }
+
     template <typename T>
     size_t WriteSpan(std::span<const T> data) const {
         static_assert(std::is_trivially_copyable_v<T>, "Data type must be trivially copyable.");

@@ -39,4 +39,7 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
 
 bool MustKeepDrawing(); // Force the emulator redraw
 
+// Writes imgui.ini, never while another thread does (see Issue #56).
+void SaveIniSettings();
+
 } // namespace ImGui::Core

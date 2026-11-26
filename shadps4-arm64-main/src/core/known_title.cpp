@@ -1659,6 +1659,26 @@ bool IsHeadsetSceneSize(u32 width, u32 height) {
     return false;
 }
 
+bool WantsEvenView() {
+    // SHADPS4_TITLE_EVEN_VIEW=0: the title is told what its headset shows, uneven or not.
+    // =1: an even view also where it is not the rule. The rule: on a PC, whose graphics card
+    // has pixels to spare for the part of the wider picture the headset does not show; not in
+    // the headset itself, where every pixel of the picture is needed for what is seen.
+    static const int wanted = [] {
+        const char* value = std::getenv("SHADPS4_TITLE_EVEN_VIEW");
+        if (value != nullptr && (value[0] == '0' || value[0] == '1')) {
+            return value[0] - '0';
+        }
+#ifdef ENABLE_BACHATA_RUNTIME
+        return 0;
+#else
+        return 1;
+#endif
+    }();
+    const Build* const build = known_build.load(std::memory_order_acquire);
+    return wanted == 1 && build != nullptr && build->uneven_view_loses_effects;
+}
+
 bool IsSceneEnlargement(u64 pgm_hash) {
     // The same program in versions 1.00 and 1.04 (traced on the headset and on the PC).
     static constexpr u64 FinalPass = 0x2ed5e2b0;

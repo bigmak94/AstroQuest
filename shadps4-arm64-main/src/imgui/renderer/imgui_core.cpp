@@ -2,8 +2,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
@@ -37,9 +45,80 @@ static std::mutex change_layers_mutex{};
 static ImGuiID dock_id;
 static std::atomic<std::uint32_t> force_gamepad_input_capture_count{0};
 
+// ImGui builds the text of imgui.ini in one buffer of its context. Two threads saving at once
+// (the save at quick_exit on the thread that ends the emulator, ImGui's own timed save inside
+// NewFrame on the render thread) append into that buffer together, and the file then holds
+// every section twice, interleaved. Its docking nodes are then registered twice when the file
+// is read at the next start, which ImGui asserts on: the emulator stopped at every start with
+// signal 5 (Issue #56). One save at a time; the one at exit gives up rather than wait for a
+// render thread that may never come back.
+static std::recursive_timed_mutex ini_mutex;
+
+// The text of an imgui.ini with each docking node kept once: the first line that names an ID
+// stays, later lines naming the same ID are left out. `removed` counts what was left out.
+static std::string WithoutRepeatedDockNodes(const std::string& text, int& removed) {
+    std::string out;
+    out.reserve(text.size());
+    std::unordered_set<std::string> seen;
+    bool in_docking = false;
+    size_t at = 0;
+    removed = 0;
+    while (at < text.size()) {
+        size_t end = text.find('\n', at);
+        end = end == std::string::npos ? text.size() : end + 1;
+        const std::string_view line{text.data() + at, end - at};
+        at = end;
+        if (!line.empty() && line.front() == '[') {
+            in_docking = line.starts_with("[Docking][Data]");
+        } else if (in_docking) {
+            const size_t first = line.find_first_not_of(' ');
+            const size_t id_at = line.find(" ID=");
+            if (first != std::string_view::npos && line.substr(first).starts_with("Dock") &&
+                id_at != std::string_view::npos) {
+                const size_t id_end = line.find_first_of(" \r\n", id_at + 4);
+                std::string id{line.substr(id_at + 4, id_end == std::string_view::npos
+                                                          ? std::string_view::npos
+                                                          : id_end - (id_at + 4))};
+                if (!seen.insert(std::move(id)).second) {
+                    ++removed;
+                    continue;
+                }
+            }
+        }
+        out.append(line);
+    }
+    return out;
+}
+
+// Reads imgui.ini before ImGui does, when a docking node is named in it more than once: ImGui
+// is then given the text with each node once, and saves it so the next start reads it clean.
+static void LoadIniWithoutRepeatedDockNodes(const std::filesystem::path& path) {
+    std::ifstream file{path, std::ios::binary};
+    if (!file) {
+        return;
+    }
+    const std::string text{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+    int removed = 0;
+    const std::string clean = WithoutRepeatedDockNodes(text, removed);
+    if (removed == 0) {
+        return; // ImGui reads the file itself at its first frame, as always.
+    }
+    LOG_WARNING(ImGui,
+                "imgui.ini named {} docking node(s) a second time (the file had been saved by "
+                "two threads at once): read without the repeats, and saved again clean",
+                removed);
+    ImGui::LoadIniSettingsFromMemory(clean.data(), clean.size());
+    ImGui::MarkIniSettingsDirty();
+}
+
 namespace ImGui {
 
 namespace Core {
+
+void SaveIniSettings() {
+    std::scoped_lock lock{ini_mutex};
+    SaveIniSettingsToDisk(GetIO().IniFilename);
+}
 
 void AcquireGamepadInputCapture() {
     force_gamepad_input_capture_count.fetch_add(1, std::memory_order_relaxed);
@@ -121,6 +200,8 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
 
     std::fprintf(stderr, "BACHATA_IMGUI_DEVTOOLS\n");
     ::Core::Devtools::Layer::SetupSettings();
+    // After the settings handlers exist, so that the layer's own sections are read too.
+    LoadIniWithoutRepeatedDockNodes(config_path);
     std::fprintf(stderr, "BACHATA_IMGUI_SDL\n");
     Sdl::Init(window.GetSDLWindow());
 
@@ -155,7 +236,12 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
         GetIO().FontGlobalScale *= dpi;
     }
 
-    std::at_quick_exit([] { SaveIniSettingsToDisk(GetIO().IniFilename); });
+    std::at_quick_exit([] {
+        std::unique_lock lock{ini_mutex, std::defer_lock};
+        if (lock.try_lock_for(std::chrono::milliseconds{500})) {
+            SaveIniSettingsToDisk(GetIO().IniFilename);
+        }
+    });
 }
 
 void OnResize() {
@@ -246,7 +332,11 @@ ImGuiID NewFrame(bool is_reusing_frame) {
     }
 
     Sdl::NewFrame(is_reusing_frame);
-    ImGui::NewFrame();
+    {
+        // ImGui saves imgui.ini from here when its settings changed a few seconds ago.
+        std::scoped_lock lock{ini_mutex};
+        ImGui::NewFrame();
+    }
 
     ImGuiWindowFlags flags =
         ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_AutoHideTabBar;

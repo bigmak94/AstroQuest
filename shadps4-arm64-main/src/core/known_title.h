@@ -81,6 +81,12 @@ bool IsSceneSize(u32 width, u32 height);
 /// draws at now), where the title is known.
 bool IsHeadsetSceneSize(u32 width, u32 height);
 
+/// Whether the title that runs is to be told that its headset shows as far to one side as to
+/// the other (the further of the two), because the build leaves effects out of an eye whose
+/// view is not even (Builds::Build::uneven_view_loses_effects). It then draws wider than the
+/// headset shows on each eye's inner side; the headset shows the part it has.
+bool WantsEvenView();
+
 /// Whether a shader program of the title's (its hash) is the pixel shader of its final pass,
 /// which enlarges the scene to the picture handed to the headset (and sets its tone and levels):
 /// one full-screen draw for each eye's picture, sampling the scene bilinearly (TitleUpscale).

@@ -487,6 +487,40 @@ Things that had to be right, for whoever works on this again:
   Every port plays on a device of its own, never on "the default device" as such (see
   "Fixed and added in 0.19").
 
+## Fixed in 0.25 (2026-11-26)
+
+- **Jump streaks, landing dust and other effects in one eye only** (issue #18). It happens
+  with version 1.00 of the game and not with its last update, 1.04. Version 1.00 leaves these
+  effects out of an eye's picture towards the side that eye sees less far to, whenever its
+  view is wider to one side than to the other: on the left of the view only the left eye had
+  them, on the right only the right eye. A PlayStation VR's view is nearly even (50.4 and 49.8
+  degrees), so the console never showed it; a Quest 3's is 54 degrees outwards and 40 inwards,
+  an Index's 57 and 46. With version 1.00 the emulator now tells the game that the headset
+  shows as far inwards as outwards: the game draws each eye's picture wider than the headset
+  shows (124% as wide for a Quest 3), and the headset shows the part it has. The same pixels
+  then cover more degrees from left to right, so the picture is a little softer that way: one
+  step up in the launcher's resolution makes up for it. The log says so when it applies
+  ("This version of the title leaves effects out of an eye whose view is wider to one
+  side"). With the 1.04 update nothing changes. `env=SHADPS4_TITLE_EVEN_VIEW=0` in
+  `settings.txt` turns it off.
+- **A crash in the game's animation code that came back at the same place on one PC** (issue
+  #40, in the intro). When the game reads a file, Windows copies the bytes into the game's
+  memory itself; if the emulator's graphics thread is watching a page of that memory at that
+  moment (memory a texture was made from earlier), Windows' copy stops there without telling
+  the emulator, and the game went on with whatever the memory held before. Such a read is now
+  noticed and finished by the emulator ("A read of ... ended after ...: the rest is read
+  again and copied in" in the log). The headset's system does the same, so this applies
+  there too (issue #55 may be it).
+- **The emulator stopped at every start, before the game drew anything** (issue #56, seen on a
+  Quest 3S; the PC had it too). The emulator keeps the layout of its debug windows in
+  `user\imgui.ini`. When two threads saved that file at the same moment (the save made as
+  the emulator ends, and the one made a few seconds after a change), their two copies came
+  out mixed together, and at the next start the debugging library refused the file's
+  repeated entries and stopped the emulator ("DockContextFindNodeByID" in the log). Saves now
+  wait for each other, and a file that already has repeats is read without them and saved
+  again clean ("imgui.ini named ... a second time" in the log). Deleting `imgui.ini` was the
+  way out before 0.25; it is still harmless.
+
 ## Fixed and added in 0.24 (2026-11-14)
 
 - **When Windows ends the emulator on the spot** (code -1073740791, issue #46), the launcher

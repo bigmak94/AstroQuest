@@ -127,6 +127,13 @@ struct Build {
     /// Where the hero's throw works out how far ahead of a moving target to aim
     /// (ThrowLeadChanges).
     std::array<Change, 2> throw_lead;
+    /// Whether the build leaves effects (the streaks of a jump, the dust of a landing, the
+    /// spray of a waterfall, puddles) out of an eye's picture when that eye's view reaches
+    /// further to one side than to the other, towards the side it reaches less far to: the
+    /// left eye loses them on the right of the view, the right eye on the left (issue #18).
+    /// A PlayStation VR's view is nearly even (50.4 and 49.8 degrees), so it does not show
+    /// there; a Quest 3's is 54 and 40. 1.00 does it, the last update does not.
+    bool uneven_view_loses_effects;
 };
 
 inline constexpr std::array<Build, 2> Known{{
@@ -192,6 +199,7 @@ inline constexpr std::array<Build, 2> Known{{
         // vpermilps xmm1, xmm1, 0; vmulps xmm0, xmm8, xmm1
         .throw_lead = {{{0x933f30, 0x008cd8080559b8c5, 0x00d349780d5eb2c5, 8},
                         {0x933f38, 0xf8c500c90479c3c4, 0xb8c500c90479e3c4, 8}}},
+        .uneven_view_loses_effects = true,
     },
     {
         .name = "1.04, the last update",
@@ -246,6 +254,7 @@ inline constexpr std::array<Build, 2> Known{{
         // The same at 0x996cf0, the engine's seconds a frame at 0x17208c0.
         .throw_lead = {{{0x996cf0, 0x008fd6d80559b8c5, 0x00d89bc80d5eb2c5, 8},
                         {0x996cf8, 0xf8c500c90479c3c4, 0xb8c500c90479e3c4, 8}}},
+        .uneven_view_loses_effects = false,
     },
 }};
 

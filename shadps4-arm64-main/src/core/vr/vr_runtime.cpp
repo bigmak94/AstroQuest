@@ -13,6 +13,7 @@
 
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/known_title.h"
 #include "core/libraries/system/systemservice.h"
 #include "core/vr/headset_fov_cache.h"
 #include "core/vr/vr_host_link.h"
@@ -855,6 +856,17 @@ Fov Runtime::TitleFov() {
         }
     }
     const float scale = config.fov_scale;
+    // A build of a known title that leaves effects out of an eye whose view reaches further to
+    // one side than to the other (issue #18) is told the further of the two for both: it draws
+    // each eye wider than the headset shows on its inner side, and the headset shows the part
+    // it has. (Up and down are the same for both eyes, and stay as they are.)
+    bool evened = false;
+    const float headset_out_in_sum = base.tan_out + base.tan_in;
+    if (!config.fov_symmetric && Core::KnownTitle::WantsEvenView() &&
+        std::abs(base.tan_out - base.tan_in) > 0.05f * std::max(base.tan_out, base.tan_in)) {
+        base.tan_out = base.tan_in = std::max(base.tan_out, base.tan_in);
+        evened = true;
+    }
     if (config.fov_symmetric) {
         // Scaling asymmetric per-eye bounds also shrinks the binocular overlap: directions
         // visible on one eye's temple side become black on the other's nose side. Render an
@@ -875,6 +887,13 @@ Fov Runtime::TitleFov() {
              scale * 100.0f, config.fov_symmetric ? "the symmetric render envelope of " : "", from,
              Degrees(fov.tan_out), Degrees(fov.tan_in), Degrees(fov.tan_top),
              Degrees(fov.tan_bottom));
+    if (evened) {
+        LOG_INFO(Core_Vr,
+                 "This version of the title leaves effects out of an eye whose view is wider to "
+                 "one side: it is told the wider side for both, and draws {:.0f}% as wide as the "
+                 "headset shows (the last update of the title does not need this)",
+                 100.0f * 2.0f * fov.tan_out / (headset_out_in_sum * scale));
+    }
     return fov;
 }
 

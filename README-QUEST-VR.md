@@ -388,6 +388,22 @@ whose own touchpad the game is given, R1 now also swipes forward once (issue #43
 stars of the last boss want faster swipes than a thumb makes on the pad. A finger on the pad
 comes first. (The rest of 0.23 is the PC's: see `README-PC-VR.md`.)
 
+**App 0.25 (2026-11-26): effects in one eye only with version 1.00 of the game** (issue #18, found on the
+PC). Version 1.00 leaves jump streaks, landing dust and the like out of an eye's picture towards
+the side that eye sees less far to (the Quest 3's eyes see 54 degrees outwards and 40 inwards;
+the game's last update, 1.04, does not do it). On a PC the emulator now tells version 1.00 an
+even view and has it draw each eye wider than the headset shows. In the headset itself that is
+left off: the wider picture would spread the same few pixels over a quarter more degrees.
+`env=SHADPS4_TITLE_EVEN_VIEW=1` in `vrhost.txt` turns it on there too.
+
+**App 0.25 (2026-11-26): "The emulator was stopped by signal 5" at every start** (issue #56, a Quest
+3S). The emulator's debug-window layout file, `imgui.ini` in the app's `files/data/shadPS4`
+folder, could be saved by two threads at once and come out with its entries twice; the next
+start then stopped on them. Saves now wait for each other, and a file with repeats is read
+without them and saved clean. Also in 0.25: a file read that the system stops early (the page it writes to was being watched by the
+graphics thread) is finished by the emulator instead of leaving the game with old memory
+(issues #40 and #55).
+
 **App 0.24 (2026-11-14): the game from the headset's shared storage** (issue #44). The two places the app
 looked for the game in, its own folder under `Android/data` and `/data/local/tmp/astro/games`,
 both need adb, and a reporter with a Quest 3S could reach neither. The app now also looks in

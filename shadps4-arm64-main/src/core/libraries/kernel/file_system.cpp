@@ -355,10 +355,42 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
 s64 ReadFile(Common::FS::IOFile& file, void* buf, u64 nbytes) {
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
-    const auto remaining = file.GetSize() - file.Tell();
-    memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
+    const s64 start = file.Tell();
+    const u64 size = file.GetSize();
+    const u64 remaining = start >= 0 && size > static_cast<u64>(start) ? size - start : 0;
+    const u64 expected = std::min<u64>(nbytes, remaining);
+    memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), expected);
 
-    return file.ReadRaw<u8>(buf, nbytes);
+    u64 done = file.ReadRaw<u8>(buf, nbytes);
+    if (done >= expected || start < 0) {
+        return done;
+    }
+    // The read ended before the file did. The system copies a file's bytes into the buffer
+    // itself, and where a page of the buffer is write-protected at that moment (the GPU thread
+    // watching memory a texture or a buffer of its own was made from, protected again between
+    // the call above and the copy), its copy stops there without the fault that lets the
+    // tracker open the page: the title would go on with whatever the memory held before. The
+    // rest comes through a buffer of the emulator's own, copied in by code whose faults are
+    // handled.
+    LOG_WARNING(Kernel_Fs,
+                "A read of {:#x} bytes at {:#x} of a file into {} ended after {:#x} bytes: the "
+                "rest is read again and copied in",
+                expected, start, fmt::ptr(buf), done);
+    file.ClearError();
+    if (!file.Seek(start + static_cast<s64>(done))) {
+        return done;
+    }
+    std::vector<u8> bounce(std::min<u64>(expected - done, 1_MB));
+    while (done < expected) {
+        const u64 want = std::min<u64>(expected - done, bounce.size());
+        const u64 got = file.ReadRaw<u8>(bounce.data(), want);
+        if (got == 0) {
+            break;
+        }
+        std::memcpy(static_cast<u8*>(buf) + done, bounce.data(), got);
+        done += got;
+    }
+    return done;
 }
 
 s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
